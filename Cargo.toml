@@ -10,11 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 common = { git = "https://github.com/malvinpratama/iam-rust-common", tag = "v0.5.0" }
-proto = { git = "https://github.com/malvinpratama/iam-rust-proto", tag = "v0.4.0" }
+proto = { git = "https://github.com/malvinpratama/iam-rust-proto", tag = "v0.5.0" }
 tokio = { version = "1", features = ["full"] }
-tonic = "0.12"
-tonic-health = "0.12"
-prost = "0.13"
+tonic = "0.14"
+tonic-health = "0.14"
+tonic-tracing-opentelemetry = "0.38"
+prost = "0.14"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "macros", "migrate"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
