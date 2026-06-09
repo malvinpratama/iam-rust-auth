@@ -86,6 +86,7 @@ impl AuthSvc {
 
 #[tonic::async_trait]
 impl AuthService for AuthSvc {
+    #[tracing::instrument(skip_all)]
     async fn register(
         &self,
         request: Request<RegisterRequest>,
@@ -124,6 +125,7 @@ impl AuthService for AuthSvc {
         }))
     }
 
+    #[tracing::instrument(skip_all)]
     async fn login(
         &self,
         request: Request<LoginRequest>,
@@ -233,6 +235,7 @@ impl AuthService for AuthSvc {
         Ok(Response::new(LogoutResponse { success: true }))
     }
 
+    #[tracing::instrument(skip_all)]
     async fn validate_token(
         &self,
         request: Request<ValidateTokenRequest>,
@@ -270,6 +273,7 @@ impl AuthService for AuthSvc {
         }))
     }
 
+    #[tracing::instrument(skip_all)]
     async fn delete_user(
         &self,
         request: Request<DeleteUserRequest>,

@@ -1,6 +1,6 @@
 [package]
 name = "auth-service"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 
@@ -9,7 +9,7 @@ name = "auth-service"
 path = "src/main.rs"
 
 [dependencies]
-common = { git = "https://github.com/malvinpratama/iam-rust-common", tag = "v0.4.0" }
+common = { git = "https://github.com/malvinpratama/iam-rust-common", tag = "v0.5.0" }
 proto = { git = "https://github.com/malvinpratama/iam-rust-proto", tag = "v0.4.0" }
 tokio = { version = "1", features = ["full"] }
 tonic = "0.12"
