@@ -5,6 +5,7 @@ mod repo;
 
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use tonic::transport::Server;
 
@@ -35,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     let repo = Repo::new(pool);
     bootstrap_admin(&repo).await?;
+    bootstrap_oidc_client(&repo).await?;
 
     // Outbox relay → NATS JetStream. Optional: without NATS_URL events are still
     // recorded; the gateway's lazy profile healing keeps the system working.
@@ -112,5 +114,28 @@ async fn bootstrap_admin(repo: &Repo) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("hash admin password: {e}"))?;
     repo.create_user_with_role(&email, &hash, "admin").await?;
     tracing::info!(email, "bootstrap admin created");
+    Ok(())
+}
+
+/// Seed a demo confidential client (the admin console) on first boot. Idempotent.
+async fn bootstrap_oidc_client(repo: &Repo) -> anyhow::Result<()> {
+    let client_id = common::env_or("OIDC_CONSOLE_CLIENT_ID", "iam-admin-console");
+    let secret = common::env_or("OIDC_CONSOLE_SECRET", "console-demo-secret-change-me");
+    let redirects: Vec<String> =
+        common::env_or("OIDC_CONSOLE_REDIRECT_URIS", "http://localhost:3000/api/auth/callback/iam")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
+    let hash = hex::encode(Sha256::digest(secret.as_bytes()));
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_secret_hash, name, redirect_uris, scopes, grant_types, is_confidential) \
+         VALUES ($1,$2,'IAM Admin Console',$3, ARRAY['openid','profile','email'], ARRAY['authorization_code','refresh_token'], true) \
+         ON CONFLICT (client_id) DO NOTHING",
+    )
+    .bind(&client_id)
+    .bind(&hash)
+    .bind(&redirects)
+    .execute(&repo.pool)
+    .await?;
     Ok(())
 }
