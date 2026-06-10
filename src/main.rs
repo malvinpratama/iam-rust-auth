@@ -2,6 +2,7 @@ mod grpc;
 mod keys;
 mod relay;
 mod repo;
+mod totp;
 
 use std::time::Duration;
 
