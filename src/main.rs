@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
 
     let svc = AuthSvc::new(repo, jwt, jwt_cfg.refresh_ttl_secs, Box::new(common::email::LogSender));
 
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter.set_serving::<AuthServiceServer<AuthSvc>>().await;
 
     // Defense-in-depth: require the shared internal token on AuthService calls.

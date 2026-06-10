@@ -52,8 +52,8 @@ fn meta(md: &MetadataMap, key: &str) -> String {
 /// Verify an RFC 7636 PKCE code_verifier against the stored challenge.
 fn verify_pkce(challenge: &str, method: &str, verifier: &str) -> bool {
     match method {
-        "S256" | "" => URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == challenge,
-        "plain" => verifier == challenge,
+        "S256" => URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == challenge,
+        "plain" | "" => verifier == challenge, // RFC 7636: default method is "plain"
         _ => false,
     }
 }
@@ -252,11 +252,16 @@ impl AuthService for AuthSvc {
         if used || expired || client_id != req.client_id || redirect_uri != req.redirect_uri {
             return Err(Status::invalid_argument("invalid_grant"));
         }
-        // Single-use: burn the code immediately.
-        let _ = sqlx::query("UPDATE oauth_authorization_codes SET used = true WHERE code_hash = $1")
+        // Single-use: atomically claim the code (closes the check-then-set race).
+        let claimed = sqlx::query("UPDATE oauth_authorization_codes SET used = true WHERE code_hash = $1 AND used = false")
             .bind(&code_hash)
             .execute(&self.repo.pool)
-            .await;
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
+        if claimed != 1 {
+            return Err(Status::invalid_argument("invalid_grant"));
+        }
 
         let has_pkce = challenge.as_deref().map(|c| !c.is_empty()).unwrap_or(false);
         if has_pkce
