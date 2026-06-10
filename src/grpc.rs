@@ -314,6 +314,7 @@ impl AuthService for AuthSvc {
         &self,
         request: Request<RegisterClientRequest>,
     ) -> Result<Response<RegisterClientResponse>, Status> {
+        require_perm(request.metadata(), "role:write")?; // defense-in-depth (gateway also gates)
         let req = request.into_inner();
         let client_id = Uuid::new_v4().to_string();
         let (secret, secret_hash) = if req.is_confidential {
