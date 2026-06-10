@@ -307,9 +307,39 @@ impl AuthService for AuthSvc {
     #[tracing::instrument(skip_all)]
     async fn register_client(
         &self,
-        _request: Request<RegisterClientRequest>,
+        request: Request<RegisterClientRequest>,
     ) -> Result<Response<RegisterClientResponse>, Status> {
-        Err(Status::unimplemented("client registration not yet implemented"))
+        let req = request.into_inner();
+        let client_id = Uuid::new_v4().to_string();
+        let (secret, secret_hash) = if req.is_confidential {
+            let mut b = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut b);
+            let s = URL_SAFE_NO_PAD.encode(b);
+            let h = hex::encode(Sha256::digest(s.as_bytes()));
+            (s, Some(h))
+        } else {
+            (String::new(), None)
+        };
+        let scopes = if req.scopes.is_empty() {
+            vec!["openid".to_string(), "profile".to_string(), "email".to_string()]
+        } else {
+            req.scopes
+        };
+        sqlx::query(
+            "INSERT INTO oauth_clients (client_id, client_secret_hash, name, redirect_uris, scopes, grant_types, is_confidential) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(&client_id)
+        .bind(&secret_hash)
+        .bind(&req.name)
+        .bind(&req.redirect_uris)
+        .bind(&scopes)
+        .bind(vec!["authorization_code".to_string(), "refresh_token".to_string()])
+        .bind(req.is_confidential)
+        .execute(&self.repo.pool)
+        .await
+        .map_err(|_| Status::internal("could not register client"))?;
+        Ok(Response::new(RegisterClientResponse { client_id, client_secret: secret }))
     }
 
     #[tracing::instrument(skip_all)]
