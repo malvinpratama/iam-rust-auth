@@ -1,7 +1,12 @@
 //! Tonic implementation of AuthService.
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::{Duration, Utc};
 use rand::RngCore;
+use rsa::pkcs8::DecodePublicKey;
+use rsa::traits::PublicKeyParts;
+use rsa::RsaPublicKey;
 use sha2::{Digest, Sha256};
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
@@ -86,6 +91,33 @@ impl AuthSvc {
 
 #[tonic::async_trait]
 impl AuthService for AuthSvc {
+    // OIDC: public RS256 signing keys as a JWKS, for relying parties to verify tokens.
+    #[tracing::instrument(skip_all)]
+    async fn get_jwks(
+        &self,
+        _request: Request<GetJwksRequest>,
+    ) -> Result<Response<GetJwksResponse>, Status> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT kid, public_pem FROM oidc_signing_keys")
+                .fetch_all(&self.repo.pool)
+                .await
+                .map_err(|_| Status::internal("jwks query failed"))?;
+        let mut keys = Vec::with_capacity(rows.len());
+        for (kid, pem) in rows {
+            let pk = RsaPublicKey::from_public_key_pem(&pem)
+                .map_err(|_| Status::internal("invalid public key"))?;
+            keys.push(Jwk {
+                kid,
+                kty: "RSA".to_string(),
+                r#use: "sig".to_string(),
+                alg: "RS256".to_string(),
+                n: URL_SAFE_NO_PAD.encode(pk.n().to_bytes_be()),
+                e: URL_SAFE_NO_PAD.encode(pk.e().to_bytes_be()),
+            });
+        }
+        Ok(Response::new(GetJwksResponse { keys }))
+    }
+
     #[tracing::instrument(skip_all)]
     async fn register(
         &self,
