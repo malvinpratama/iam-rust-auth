@@ -1,4 +1,5 @@
 mod grpc;
+mod keys;
 mod relay;
 mod repo;
 
@@ -8,7 +9,6 @@ use sqlx::postgres::PgPoolOptions;
 use tonic::transport::Server;
 
 use common::config::JwtConfig;
-use common::jwt::JwtManager;
 use proto::auth::v1::auth_service_server::AuthServiceServer;
 
 use crate::grpc::AuthSvc;
@@ -30,6 +30,9 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("migrations applied");
 
+    let jwt_cfg = JwtConfig::from_env();
+    let jwt = keys::load_jwt_manager(&pool, jwt_cfg.issuer.clone(), jwt_cfg.access_ttl_secs).await?;
+
     let repo = Repo::new(pool);
     bootstrap_admin(&repo).await?;
 
@@ -46,8 +49,6 @@ async fn main() -> anyhow::Result<()> {
         _ => tracing::warn!("NATS_URL not set — event publishing disabled"),
     }
 
-    let jwt_cfg = JwtConfig::from_env();
-    let jwt = JwtManager::new(&jwt_cfg);
     let svc = AuthSvc::new(repo, jwt, jwt_cfg.refresh_ttl_secs, Box::new(common::email::LogSender));
 
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
