@@ -49,6 +49,15 @@ fn meta(md: &MetadataMap, key: &str) -> String {
     md.get(key).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
 }
 
+/// Verify an RFC 7636 PKCE code_verifier against the stored challenge.
+fn verify_pkce(challenge: &str, method: &str, verifier: &str) -> bool {
+    match method {
+        "S256" | "" => URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == challenge,
+        "plain" => verifier == challenge,
+        _ => false,
+    }
+}
+
 impl AuthSvc {
     pub fn new(repo: Repo, jwt: JwtManager, refresh_ttl_secs: i64, mail: Box<dyn Sender>) -> Self {
         let dummy_hash = password::hash("constant-time-dummy-password").unwrap_or_default();
@@ -221,13 +230,78 @@ impl AuthService for AuthSvc {
         Ok(Response::new(SaveConsentResponse { success: true }))
     }
 
-    // Token exchange (A5) and client registration (A7) land in later steps.
     #[tracing::instrument(skip_all)]
     async fn exchange_authorization_code(
         &self,
-        _request: Request<ExchangeAuthorizationCodeRequest>,
+        request: Request<ExchangeAuthorizationCodeRequest>,
     ) -> Result<Response<OidcTokenResponse>, Status> {
-        Err(Status::unimplemented("token exchange not yet implemented"))
+        let req = request.into_inner();
+        let code_hash = hex::encode(Sha256::digest(req.code.as_bytes()));
+
+        type CodeRow = (String, Uuid, String, String, Option<String>, Option<String>, Option<String>, bool, bool);
+        let row: Option<CodeRow> = sqlx::query_as(
+            "SELECT client_id, user_id, redirect_uri, scope, code_challenge, code_challenge_method, nonce, used, (expires_at < now()) \
+             FROM oauth_authorization_codes WHERE code_hash = $1",
+        )
+        .bind(&code_hash)
+        .fetch_optional(&self.repo.pool)
+        .await
+        .map_err(|_| Status::internal("code lookup failed"))?;
+        let (client_id, user_id, redirect_uri, scope, challenge, method, nonce, used, expired) =
+            row.ok_or_else(|| Status::invalid_argument("invalid_grant"))?;
+        if used || expired || client_id != req.client_id || redirect_uri != req.redirect_uri {
+            return Err(Status::invalid_argument("invalid_grant"));
+        }
+        // Single-use: burn the code immediately.
+        let _ = sqlx::query("UPDATE oauth_authorization_codes SET used = true WHERE code_hash = $1")
+            .bind(&code_hash)
+            .execute(&self.repo.pool)
+            .await;
+
+        let has_pkce = challenge.as_deref().map(|c| !c.is_empty()).unwrap_or(false);
+        if has_pkce
+            && !verify_pkce(challenge.as_deref().unwrap_or(""), method.as_deref().unwrap_or("S256"), &req.code_verifier)
+        {
+            return Err(Status::invalid_argument("invalid_grant"));
+        }
+
+        let client: Option<(Option<String>, bool)> =
+            sqlx::query_as("SELECT client_secret_hash, is_confidential FROM oauth_clients WHERE client_id = $1")
+                .bind(&client_id)
+                .fetch_optional(&self.repo.pool)
+                .await
+                .map_err(|_| Status::internal("client lookup failed"))?;
+        let (secret_hash, is_confidential) =
+            client.ok_or_else(|| Status::invalid_argument("invalid_client"))?;
+        if is_confidential {
+            let provided = hex::encode(Sha256::digest(req.client_secret.as_bytes()));
+            if secret_hash.as_deref() != Some(provided.as_str()) {
+                return Err(Status::unauthenticated("invalid_client"));
+            }
+        } else if !has_pkce {
+            return Err(Status::invalid_argument("PKCE required for public clients"));
+        }
+
+        let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&self.repo.pool)
+            .await
+            .map_err(|_| Status::internal("user lookup failed"))?;
+
+        let tp = self.issue_tokens(user_id, &email).await?;
+        let issuer = common::env_or("OIDC_ISSUER", "http://localhost:8080");
+        let id_token = self
+            .jwt
+            .issue_id_token(&user_id.to_string(), &email, &client_id, nonce.as_deref().unwrap_or(""), &issuer)
+            .map_err(|_| Status::internal("failed to sign id_token"))?;
+        Ok(Response::new(OidcTokenResponse {
+            access_token: tp.access_token,
+            id_token,
+            refresh_token: tp.refresh_token,
+            expires_in: tp.expires_in,
+            token_type: "Bearer".to_string(),
+            scope,
+        }))
     }
 
     #[tracing::instrument(skip_all)]
