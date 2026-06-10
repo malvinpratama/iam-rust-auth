@@ -94,8 +94,28 @@ impl AuthSvc {
             refresh_token: refresh,
             expires_in: self.jwt.access_ttl_secs(),
             token_type: "Bearer".into(),
+            mfa_required: false,
+            mfa_token: String::new(),
         })
     }
+}
+
+/// Short-lived TTL for the token issued between the password and TOTP steps.
+const MFA_TOKEN_TTL_SECS: i64 = 300;
+
+/// Collect the caller's permissions from gateway metadata.
+fn caller_perms(md: &MetadataMap) -> Vec<String> {
+    meta(md, "x-user-permissions")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Parse the caller's user id from gateway metadata.
+fn caller_uuid(md: &MetadataMap) -> Result<Uuid, Status> {
+    Uuid::parse_str(&meta(md, "x-user-id"))
+        .map_err(|_| Status::unauthenticated("missing or invalid caller identity"))
 }
 
 #[tonic::async_trait]
@@ -433,7 +453,31 @@ impl AuthService for AuthSvc {
             return Err(Status::unauthenticated("email not verified"));
         }
 
+        // Soft-deleted identities cannot log in (reported as invalid credentials).
+        if user.deleted_at.is_some() {
+            return Err(Status::unauthenticated("invalid credentials"));
+        }
+
         let _ = self.repo.reset_login_state(user.id).await;
+
+        // 2FA: when TOTP is enabled, issue a short-lived MFA token; the client
+        // completes login via LoginTotp with a TOTP or recovery code.
+        if user.totp_enabled {
+            self.audit_as(&user.id.to_string(), &user.email, "login.mfa_challenge", "", "").await;
+            let mfa = self
+                .jwt
+                .issue_mfa(&user.id.to_string(), MFA_TOKEN_TTL_SECS)
+                .map_err(|_| Status::internal("failed to issue mfa token"))?;
+            return Ok(Response::new(TokenPair {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_in: 0,
+                token_type: "Bearer".into(),
+                mfa_required: true,
+                mfa_token: mfa,
+            }));
+        }
+
         self.audit_as(&user.id.to_string(), &user.email, "login.success", "", "").await;
         let pair = self.issue_tokens(user.id, &user.email).await?;
         Ok(Response::new(pair))
@@ -507,6 +551,10 @@ impl AuthService for AuthSvc {
             .jwt
             .parse(&req.access_token)
             .map_err(|_| Status::unauthenticated("invalid or expired token"))?;
+        // An MFA-purpose token only completes a 2FA login; never a bearer token.
+        if !claims.purpose.is_empty() {
+            return Err(Status::unauthenticated("invalid token"));
+        }
         if self
             .repo
             .is_token_revoked(&claims.jti)
@@ -517,6 +565,15 @@ impl AuthService for AuthSvc {
         }
         let user_id =
             Uuid::parse_str(&claims.sub).map_err(|_| Status::unauthenticated("invalid subject"))?;
+        // Reject tokens for a soft-deleted (or removed) identity.
+        if !self
+            .repo
+            .is_user_active(user_id)
+            .await
+            .map_err(|_| Status::internal("failed to check account status"))?
+        {
+            return Err(Status::unauthenticated("account is not active"));
+        }
         let roles = self
             .repo
             .get_user_roles(user_id)
@@ -547,14 +604,280 @@ impl AuthService for AuthSvc {
             .map_err(|_| Status::invalid_argument("invalid user id"))?;
         let payload = serde_json::to_string(&common::events::UserDeleted {
             user_id: req.user_id.clone(),
+            hard: req.hard,
         })
         .map_err(|_| Status::internal("failed to encode event"))?;
         self.repo
-            .delete_user_event(user_id, common::events::TYPE_USER_DELETED, &payload)
+            .delete_user_event_soft(user_id, req.hard, common::events::TYPE_USER_DELETED, &payload)
             .await
             .map_err(|_| Status::internal("failed to delete user"))?;
-        self.audit(&md, "user.delete", &req.user_id, "").await;
+        self.audit(&md, "user.delete", &req.user_id, if req.hard { "hard" } else { "soft" }).await;
         Ok(Response::new(DeleteUserResponse { success: true }))
+    }
+
+    // ── 2FA / TOTP (v0.9) ──
+
+    async fn enroll_totp(
+        &self,
+        request: Request<EnrollTotpRequest>,
+    ) -> Result<Response<EnrollTotpResponse>, Status> {
+        let md = request.metadata().clone();
+        let uid = caller_uuid(&md)?;
+        let user = self
+            .repo
+            .get_user_by_id(uid)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+            .ok_or_else(|| Status::not_found("user not found"))?;
+        let secret = crate::totp::generate(&user.email).ok_or_else(|| Status::internal("failed to generate secret"))?;
+        let recovery = crate::totp::generate_recovery_codes(10);
+        self.repo
+            .set_totp_secret(uid, &secret.base32)
+            .await
+            .map_err(|_| Status::internal("failed to store secret"))?;
+        let _ = self.repo.delete_recovery_codes(uid).await;
+        for c in &recovery {
+            self.repo
+                .insert_recovery_code(uid, &hash_token(c))
+                .await
+                .map_err(|_| Status::internal("failed to store recovery code"))?;
+        }
+        self.audit(&md, "totp.enroll", "", "").await;
+        Ok(Response::new(EnrollTotpResponse {
+            secret: secret.base32,
+            otpauth_uri: secret.otpauth_uri,
+            recovery_codes: recovery,
+        }))
+    }
+
+    async fn activate_totp(
+        &self,
+        request: Request<ActivateTotpRequest>,
+    ) -> Result<Response<GenericResponse>, Status> {
+        let md = request.metadata().clone();
+        let uid = caller_uuid(&md)?;
+        let req = request.into_inner();
+        let user = self
+            .repo
+            .get_user_by_id(uid)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+            .ok_or_else(|| Status::not_found("user not found"))?;
+        let secret = user.totp_secret.ok_or_else(|| Status::failed_precondition("no pending enrollment; call EnrollTotp first"))?;
+        if !crate::totp::validate(&req.code, &secret) {
+            return Err(Status::unauthenticated("invalid code"));
+        }
+        self.repo.enable_totp(uid).await.map_err(|_| Status::internal("failed to enable 2FA"))?;
+        self.audit(&md, "totp.activate", "", "").await;
+        Ok(Response::new(GenericResponse { success: true }))
+    }
+
+    async fn disable_totp(
+        &self,
+        request: Request<DisableTotpRequest>,
+    ) -> Result<Response<GenericResponse>, Status> {
+        let md = request.metadata().clone();
+        let uid = caller_uuid(&md)?;
+        let req = request.into_inner();
+        let user = self
+            .repo
+            .get_user_by_id(uid)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+            .ok_or_else(|| Status::not_found("user not found"))?;
+        if !user.totp_enabled {
+            return Ok(Response::new(GenericResponse { success: true }));
+        }
+        let ok = user.totp_secret.as_deref().map(|s| crate::totp::validate(&req.code, s)).unwrap_or(false);
+        let ok = ok
+            || self
+                .repo
+                .consume_recovery_code(uid, &hash_token(&req.code))
+                .await
+                .map_err(|_| Status::internal("db error"))?;
+        if !ok {
+            return Err(Status::unauthenticated("invalid code"));
+        }
+        self.repo.disable_totp(uid).await.map_err(|_| Status::internal("failed to disable 2FA"))?;
+        let _ = self.repo.delete_recovery_codes(uid).await;
+        self.audit(&md, "totp.disable", "", "").await;
+        Ok(Response::new(GenericResponse { success: true }))
+    }
+
+    async fn login_totp(
+        &self,
+        request: Request<LoginTotpRequest>,
+    ) -> Result<Response<TokenPair>, Status> {
+        let req = request.into_inner();
+        let claims = self
+            .jwt
+            .parse(&req.mfa_token)
+            .map_err(|_| Status::unauthenticated("invalid or expired mfa token"))?;
+        if claims.purpose != "mfa" {
+            return Err(Status::unauthenticated("invalid mfa token"));
+        }
+        let uid = Uuid::parse_str(&claims.sub).map_err(|_| Status::unauthenticated("invalid mfa token"))?;
+        let user = self
+            .repo
+            .get_user_by_id(uid)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+            .filter(|u| u.deleted_at.is_none() && u.totp_enabled && u.totp_secret.is_some())
+            .ok_or_else(|| Status::unauthenticated("invalid credentials"))?;
+        let secret = user.totp_secret.clone().unwrap();
+        let ok = crate::totp::validate(&req.code, &secret)
+            || self
+                .repo
+                .consume_recovery_code(uid, &hash_token(&req.code))
+                .await
+                .map_err(|_| Status::internal("db error"))?;
+        if !ok {
+            self.audit_as(&uid.to_string(), &user.email, "login.mfa_failure", "", "").await;
+            return Err(Status::unauthenticated("invalid code"));
+        }
+        self.audit_as(&uid.to_string(), &user.email, "login.success", "", "2fa").await;
+        let pair = self.issue_tokens(uid, &user.email).await?;
+        Ok(Response::new(pair))
+    }
+
+    // ── API keys (v0.9) ──
+
+    async fn create_api_key(
+        &self,
+        request: Request<CreateApiKeyRequest>,
+    ) -> Result<Response<CreateApiKeyResponse>, Status> {
+        let md = request.metadata().clone();
+        let uid = caller_uuid(&md)?;
+        let perms = caller_perms(&md);
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        for s in &req.scopes {
+            if !perms.iter().any(|p| p == s) {
+                return Err(Status::permission_denied(format!("cannot grant a scope you do not hold: {s}")));
+            }
+        }
+        let key_id = gen_hex(8);
+        let secret = gen_hex(24);
+        let full = format!("iamk_{key_id}_{secret}");
+        let expires = if req.ttl_seconds > 0 {
+            Some(Utc::now() + Duration::seconds(req.ttl_seconds))
+        } else {
+            None
+        };
+        self.repo
+            .create_api_key(&key_id, uid, &hash_token(&full), &req.name, &req.scopes, expires)
+            .await
+            .map_err(|_| Status::internal("failed to create api key"))?;
+        self.audit(&md, "apikey.create", &key_id, &req.name).await;
+        Ok(Response::new(CreateApiKeyResponse {
+            secret: full,
+            key: Some(ApiKey {
+                id: key_id,
+                name: req.name,
+                scopes: req.scopes,
+                created_at: Utc::now().to_rfc3339(),
+                expires_at: expires.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                last_used_at: String::new(),
+            }),
+        }))
+    }
+
+    async fn list_api_keys(
+        &self,
+        request: Request<ListApiKeysRequest>,
+    ) -> Result<Response<ListApiKeysResponse>, Status> {
+        let uid = caller_uuid(request.metadata())?;
+        let rows = self.repo.list_api_keys(uid).await.map_err(|_| Status::internal("failed to list api keys"))?;
+        let keys = rows
+            .into_iter()
+            .map(|r| ApiKey {
+                id: r.id,
+                name: r.name,
+                scopes: r.scopes,
+                created_at: r.created_at.to_rfc3339(),
+                expires_at: r.expires_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                last_used_at: r.last_used_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+            })
+            .collect();
+        Ok(Response::new(ListApiKeysResponse { keys }))
+    }
+
+    async fn revoke_api_key(
+        &self,
+        request: Request<RevokeApiKeyRequest>,
+    ) -> Result<Response<GenericResponse>, Status> {
+        let md = request.metadata().clone();
+        let uid = caller_uuid(&md)?;
+        let req = request.into_inner();
+        self.repo
+            .revoke_api_key(&req.id, uid)
+            .await
+            .map_err(|_| Status::internal("failed to revoke api key"))?;
+        self.audit(&md, "apikey.revoke", &req.id, "").await;
+        Ok(Response::new(GenericResponse { success: true }))
+    }
+
+    async fn validate_api_key(
+        &self,
+        request: Request<ValidateApiKeyRequest>,
+    ) -> Result<Response<ValidateApiKeyResponse>, Status> {
+        let req = request.into_inner();
+        let row = self
+            .repo
+            .get_api_key_by_hash(&hash_token(&req.api_key))
+            .await
+            .map_err(|_| Status::internal("db error"))?
+            .ok_or_else(|| Status::unauthenticated("invalid api key"))?;
+        if row.revoked_at.is_some() {
+            return Err(Status::unauthenticated("api key revoked"));
+        }
+        if let Some(exp) = row.expires_at {
+            if exp < Utc::now() {
+                return Err(Status::unauthenticated("api key expired"));
+            }
+        }
+        let user = self
+            .repo
+            .get_user_by_id(row.user_id)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+            .filter(|u| u.deleted_at.is_none())
+            .ok_or_else(|| Status::unauthenticated("invalid api key"))?;
+        // Effective scopes = key scopes ∩ the owner's current permissions.
+        let perms = self
+            .repo
+            .get_user_permissions(row.user_id)
+            .await
+            .map_err(|_| Status::internal("failed to load permissions"))?;
+        let scopes: Vec<String> = row.scopes.into_iter().filter(|s| perms.contains(s)).collect();
+        let _ = self.repo.touch_api_key(&row.id).await;
+        Ok(Response::new(ValidateApiKeyResponse {
+            user_id: row.user_id.to_string(),
+            email: user.email,
+            scopes,
+        }))
+    }
+
+    // ── Soft-delete restore (v0.9) ──
+
+    async fn restore_user(
+        &self,
+        request: Request<RestoreUserRequest>,
+    ) -> Result<Response<GenericResponse>, Status> {
+        require_perm(request.metadata(), "user:delete")?;
+        let md = request.metadata().clone();
+        let req = request.into_inner();
+        let user_id = Uuid::parse_str(&req.user_id).map_err(|_| Status::invalid_argument("invalid user id"))?;
+        let payload = serde_json::to_string(&common::events::UserRestored { user_id: req.user_id.clone() })
+            .map_err(|_| Status::internal("failed to encode event"))?;
+        self.repo
+            .restore_user_event(user_id, common::events::TYPE_USER_RESTORED, &payload)
+            .await
+            .map_err(|_| Status::internal("failed to restore user"))?;
+        self.audit(&md, "user.restore", &req.user_id, "").await;
+        Ok(Response::new(GenericResponse { success: true }))
     }
 
     async fn create_role(
@@ -878,6 +1201,12 @@ impl AuthService for AuthSvc {
 
 fn gen_refresh_token() -> String {
     let mut b = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut b);
+    hex::encode(b)
+}
+
+fn gen_hex(n: usize) -> String {
+    let mut b = vec![0u8; n];
     rand::thread_rng().fill_bytes(&mut b);
     hex::encode(b)
 }

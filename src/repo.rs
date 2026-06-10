@@ -14,6 +14,28 @@ pub struct UserRow {
     pub email_verified: bool,
     pub failed_login_attempts: i32,
     pub locked_until: Option<DateTime<Utc>>,
+    pub totp_secret: Option<String>,
+    pub totp_enabled: bool,
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow)]
+pub struct ApiKeyRow {
+    pub id: String,
+    pub user_id: Uuid,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow)]
+pub struct ApiKeyMeta {
+    pub id: String,
+    pub name: String,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(FromRow)]
@@ -98,7 +120,7 @@ impl Repo {
 
     pub async fn get_user_by_email(&self, email: &str) -> sqlx::Result<Option<UserRow>> {
         sqlx::query_as::<_, UserRow>(
-            "SELECT id, email, password_hash, status, email_verified, failed_login_attempts, locked_until FROM users WHERE email = $1",
+            "SELECT id, email, password_hash, status, email_verified, failed_login_attempts, locked_until, totp_secret, totp_enabled, deleted_at FROM users WHERE email = $1",
         )
         .bind(email)
         .fetch_optional(&self.pool)
@@ -107,7 +129,7 @@ impl Repo {
 
     pub async fn get_user_by_id(&self, id: Uuid) -> sqlx::Result<Option<UserRow>> {
         sqlx::query_as::<_, UserRow>(
-            "SELECT id, email, password_hash, status, email_verified, failed_login_attempts, locked_until FROM users WHERE id = $1",
+            "SELECT id, email, password_hash, status, email_verified, failed_login_attempts, locked_until, totp_secret, totp_enabled, deleted_at FROM users WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -120,6 +142,122 @@ impl Repo {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// True if the identity exists and is not soft-deleted.
+    pub async fn is_user_active(&self, id: Uuid) -> sqlx::Result<bool> {
+        let v: Option<bool> = sqlx::query_scalar("SELECT (deleted_at IS NULL) FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(v.unwrap_or(false))
+    }
+
+    /// Soft-delete (or hard-delete when `hard`) the identity and enqueue a
+    /// UserDeleted event in one transaction. Soft also revokes refresh tokens.
+    pub async fn delete_user_event_soft(
+        &self,
+        id: Uuid,
+        hard: bool,
+        event_type: &str,
+        payload: &str,
+    ) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        if hard {
+            sqlx::query("DELETE FROM users WHERE id = $1").bind(id).execute(&mut *tx).await?;
+        } else {
+            sqlx::query("UPDATE users SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL")
+                .bind(id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL")
+                .bind(id).execute(&mut *tx).await?;
+        }
+        sqlx::query("INSERT INTO outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3::jsonb)")
+            .bind(id).bind(event_type).bind(payload).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Restore a soft-deleted identity and enqueue a UserRestored event.
+    pub async fn restore_user_event(&self, id: Uuid, event_type: &str, payload: &str) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE users SET deleted_at = NULL, updated_at = now() WHERE id = $1")
+            .bind(id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3::jsonb)")
+            .bind(id).bind(event_type).bind(payload).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ── 2FA / TOTP (v0.9) ──
+
+    pub async fn set_totp_secret(&self, id: Uuid, secret: &str) -> sqlx::Result<()> {
+        sqlx::query("UPDATE users SET totp_secret = $2, totp_enabled = false, updated_at = now() WHERE id = $1")
+            .bind(id).bind(secret).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn enable_totp(&self, id: Uuid) -> sqlx::Result<()> {
+        sqlx::query("UPDATE users SET totp_enabled = true, updated_at = now() WHERE id = $1")
+            .bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn disable_totp(&self, id: Uuid) -> sqlx::Result<()> {
+        sqlx::query("UPDATE users SET totp_secret = NULL, totp_enabled = false, updated_at = now() WHERE id = $1")
+            .bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn insert_recovery_code(&self, user_id: Uuid, code_hash: &str) -> sqlx::Result<()> {
+        sqlx::query("INSERT INTO totp_recovery_codes (user_id, code_hash) VALUES ($1, $2)")
+            .bind(user_id).bind(code_hash).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn delete_recovery_codes(&self, user_id: Uuid) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM totp_recovery_codes WHERE user_id = $1")
+            .bind(user_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Atomically spend a one-time recovery code; true on success.
+    pub async fn consume_recovery_code(&self, user_id: Uuid, code_hash: &str) -> sqlx::Result<bool> {
+        let id: Option<i64> = sqlx::query_scalar(
+            "UPDATE totp_recovery_codes SET used_at = now() WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL RETURNING id",
+        )
+        .bind(user_id).bind(code_hash).fetch_optional(&self.pool).await?;
+        Ok(id.is_some())
+    }
+
+    // ── API keys (v0.9) ──
+
+    pub async fn create_api_key(&self, id: &str, user_id: Uuid, key_hash: &str, name: &str, scopes: &[String], expires_at: Option<DateTime<Utc>>) -> sqlx::Result<()> {
+        sqlx::query("INSERT INTO api_keys (id, user_id, key_hash, name, scopes, expires_at) VALUES ($1, $2, $3, $4, $5, $6)")
+            .bind(id).bind(user_id).bind(key_hash).bind(name).bind(scopes).bind(expires_at)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn get_api_key_by_hash(&self, key_hash: &str) -> sqlx::Result<Option<ApiKeyRow>> {
+        sqlx::query_as::<_, ApiKeyRow>("SELECT id, user_id, scopes, expires_at, revoked_at FROM api_keys WHERE key_hash = $1")
+            .bind(key_hash).fetch_optional(&self.pool).await
+    }
+
+    pub async fn list_api_keys(&self, user_id: Uuid) -> sqlx::Result<Vec<ApiKeyMeta>> {
+        sqlx::query_as::<_, ApiKeyMeta>("SELECT id, name, scopes, expires_at, last_used_at, created_at FROM api_keys WHERE user_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC")
+            .bind(user_id).fetch_all(&self.pool).await
+    }
+
+    pub async fn revoke_api_key(&self, id: &str, user_id: Uuid) -> sqlx::Result<()> {
+        sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL")
+            .bind(id).bind(user_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn touch_api_key(&self, id: &str) -> sqlx::Result<()> {
+        sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE id = $1")
+            .bind(id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -151,28 +289,6 @@ impl Repo {
         .bind(role)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("INSERT INTO outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3::jsonb)")
-            .bind(id)
-            .bind(event_type)
-            .bind(payload)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Delete a user + a UserDeleted outbox row in one tx.
-    pub async fn delete_user_event(
-        &self,
-        id: Uuid,
-        event_type: &str,
-        payload: &str,
-    ) -> sqlx::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM users WHERE id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
         sqlx::query("INSERT INTO outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3::jsonb)")
             .bind(id)
             .bind(event_type)

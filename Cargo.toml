@@ -9,8 +9,8 @@ name = "auth-service"
 path = "src/main.rs"
 
 [dependencies]
-common = { git = "https://github.com/malvinpratama/iam-rust-common", tag = "v0.7.0" }
-proto = { git = "https://github.com/malvinpratama/iam-rust-proto", tag = "v0.7.0" }
+common = { git = "https://github.com/malvinpratama/iam-rust-common", tag = "v0.8.0" }
+proto = { git = "https://github.com/malvinpratama/iam-rust-proto", tag = "v0.8.0" }
 tokio = { version = "1", features = ["full"] }
 tonic = "0.14"
 tonic-health = "0.14"
@@ -22,6 +22,7 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
+totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
 rsa = { version = "0.9", features = ["pem"] }
 base64 = "0.22"
 tracing = "0.1"
