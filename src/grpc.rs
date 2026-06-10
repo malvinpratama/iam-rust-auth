@@ -118,6 +118,126 @@ impl AuthService for AuthSvc {
         Ok(Response::new(GetJwksResponse { keys }))
     }
 
+    // ── OIDC Authorization Code + PKCE ──────────────────────
+
+    #[tracing::instrument(skip_all)]
+    async fn get_client(
+        &self,
+        request: Request<GetClientRequest>,
+    ) -> Result<Response<OAuthClient>, Status> {
+        let req = request.into_inner();
+        let row = sqlx::query_as::<_, (String, String, Vec<String>, Vec<String>, Vec<String>, bool)>(
+            "SELECT client_id, name, redirect_uris, scopes, grant_types, is_confidential \
+             FROM oauth_clients WHERE client_id = $1",
+        )
+        .bind(&req.client_id)
+        .fetch_optional(&self.repo.pool)
+        .await
+        .map_err(|_| Status::internal("client lookup failed"))?;
+        match row {
+            Some((client_id, name, redirect_uris, scopes, grant_types, is_confidential)) => {
+                Ok(Response::new(OAuthClient {
+                    client_id,
+                    name,
+                    redirect_uris,
+                    scopes,
+                    grant_types,
+                    is_confidential,
+                }))
+            }
+            None => Err(Status::not_found("client not found")),
+        }
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn create_authorization_code(
+        &self,
+        request: Request<CreateAuthorizationCodeRequest>,
+    ) -> Result<Response<CreateAuthorizationCodeResponse>, Status> {
+        let req = request.into_inner();
+        let user_id =
+            Uuid::parse_str(&req.user_id).map_err(|_| Status::invalid_argument("invalid user id"))?;
+        let mut b = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut b);
+        let code = URL_SAFE_NO_PAD.encode(b);
+        let code_hash = hex::encode(Sha256::digest(code.as_bytes()));
+        sqlx::query(
+            "INSERT INTO oauth_authorization_codes \
+             (code_hash, client_id, user_id, redirect_uri, scope, code_challenge, code_challenge_method, nonce, expires_at) \
+             VALUES ($1,$2,$3,$4,$5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), now() + interval '5 minutes')",
+        )
+        .bind(&code_hash)
+        .bind(&req.client_id)
+        .bind(user_id)
+        .bind(&req.redirect_uri)
+        .bind(&req.scope)
+        .bind(&req.code_challenge)
+        .bind(&req.code_challenge_method)
+        .bind(&req.nonce)
+        .execute(&self.repo.pool)
+        .await
+        .map_err(|_| Status::internal("could not create authorization code"))?;
+        Ok(Response::new(CreateAuthorizationCodeResponse { code }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn get_consent(
+        &self,
+        request: Request<GetConsentRequest>,
+    ) -> Result<Response<GetConsentResponse>, Status> {
+        let req = request.into_inner();
+        let user_id =
+            Uuid::parse_str(&req.user_id).map_err(|_| Status::invalid_argument("invalid user id"))?;
+        let row: Option<(Vec<String>,)> =
+            sqlx::query_as("SELECT scopes FROM oauth_consents WHERE user_id = $1 AND client_id = $2")
+                .bind(user_id)
+                .bind(&req.client_id)
+                .fetch_optional(&self.repo.pool)
+                .await
+                .map_err(|_| Status::internal("consent lookup failed"))?;
+        Ok(Response::new(GetConsentResponse {
+            scopes: row.map(|r| r.0).unwrap_or_default(),
+        }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn save_consent(
+        &self,
+        request: Request<SaveConsentRequest>,
+    ) -> Result<Response<SaveConsentResponse>, Status> {
+        let req = request.into_inner();
+        let user_id =
+            Uuid::parse_str(&req.user_id).map_err(|_| Status::invalid_argument("invalid user id"))?;
+        sqlx::query(
+            "INSERT INTO oauth_consents (user_id, client_id, scopes) VALUES ($1,$2,$3) \
+             ON CONFLICT (user_id, client_id) DO UPDATE SET scopes = EXCLUDED.scopes, granted_at = now()",
+        )
+        .bind(user_id)
+        .bind(&req.client_id)
+        .bind(&req.scopes)
+        .execute(&self.repo.pool)
+        .await
+        .map_err(|_| Status::internal("could not save consent"))?;
+        Ok(Response::new(SaveConsentResponse { success: true }))
+    }
+
+    // Token exchange (A5) and client registration (A7) land in later steps.
+    #[tracing::instrument(skip_all)]
+    async fn exchange_authorization_code(
+        &self,
+        _request: Request<ExchangeAuthorizationCodeRequest>,
+    ) -> Result<Response<OidcTokenResponse>, Status> {
+        Err(Status::unimplemented("token exchange not yet implemented"))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn register_client(
+        &self,
+        _request: Request<RegisterClientRequest>,
+    ) -> Result<Response<RegisterClientResponse>, Status> {
+        Err(Status::unimplemented("client registration not yet implemented"))
+    }
+
     #[tracing::instrument(skip_all)]
     async fn register(
         &self,
