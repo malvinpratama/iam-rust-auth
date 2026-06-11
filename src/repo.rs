@@ -164,15 +164,6 @@ impl Repo {
 
     /// Soft-delete (or hard-delete when `hard`) the identity and enqueue a
     /// UserDeleted event in one transaction. Soft also revokes refresh tokens.
-    /// Plain soft-delete (no event) — used by the saga compensator.
-    pub async fn soft_delete_user(&self, id: Uuid) -> sqlx::Result<()> {
-        sqlx::query("UPDATE users SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     pub async fn delete_user_event_soft(
         &self,
         id: Uuid,
