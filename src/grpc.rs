@@ -357,7 +357,23 @@ impl AuthService for AuthSvc {
             .await
             .map_err(|_| Status::internal("user lookup failed"))?;
 
-        let tp = self.issue_for_active_tenant(user_id, &email).await?;
+        // M6.5: bind the session to the OIDC client's tenant — the client
+        // identifies the organization this app serves; the user must be a member.
+        let client_tenant: Uuid =
+            sqlx::query_scalar("SELECT tenant_id FROM oauth_clients WHERE client_id = $1")
+                .bind(&client_id)
+                .fetch_one(&self.repo.pool)
+                .await
+                .map_err(|_| Status::internal("client tenant lookup failed"))?;
+        if !self
+            .repo
+            .is_active_member(user_id, client_tenant)
+            .await
+            .map_err(|_| Status::internal("membership check failed"))?
+        {
+            return Err(Status::permission_denied("not a member of this organization"));
+        }
+        let tp = self.issue_tokens(user_id, &email, client_tenant, None).await?;
         let issuer = common::env_or("OIDC_ISSUER", "http://localhost:8080");
         let id_token = self
             .jwt
@@ -379,6 +395,8 @@ impl AuthService for AuthSvc {
         request: Request<RegisterClientRequest>,
     ) -> Result<Response<RegisterClientResponse>, Status> {
         require_perm(request.metadata(), "role:write")?; // defense-in-depth (gateway also gates)
+        // M6.5: the new client belongs to the caller's active tenant.
+        let tenant = active_tenant(request.metadata())?;
         let req = request.into_inner();
         let client_id = Uuid::new_v4().to_string();
         let (secret, secret_hash) = if req.is_confidential {
@@ -396,8 +414,8 @@ impl AuthService for AuthSvc {
             req.scopes
         };
         sqlx::query(
-            "INSERT INTO oauth_clients (client_id, client_secret_hash, name, redirect_uris, scopes, grant_types, is_confidential) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            "INSERT INTO oauth_clients (client_id, client_secret_hash, name, redirect_uris, scopes, grant_types, is_confidential, tenant_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
         )
         .bind(&client_id)
         .bind(&secret_hash)
@@ -406,6 +424,7 @@ impl AuthService for AuthSvc {
         .bind(&scopes)
         .bind(vec!["authorization_code".to_string(), "refresh_token".to_string()])
         .bind(req.is_confidential)
+        .bind(tenant)
         .execute(&self.repo.pool)
         .await
         .map_err(|_| Status::internal("could not register client"))?;
