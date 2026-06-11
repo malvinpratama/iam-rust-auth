@@ -633,3 +633,79 @@ impl Repo {
         Ok(())
     }
 }
+
+// ── Integration tests against a real Postgres (testcontainers) ──
+// Run with: cargo test --features integration   (needs Docker)
+#[cfg(all(test, feature = "integration"))]
+mod integration {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::ContainerAsync;
+
+    // Spin up a throwaway Postgres, apply the embedded migrations, return a Repo.
+    // The container is dropped (stopped) when the returned guard is dropped.
+    async fn setup() -> (Repo, ContainerAsync<Postgres>) {
+        let node = Postgres::default().start().await.expect("start postgres");
+        let port = node.get_host_port_ipv4(5432).await.expect("port");
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await
+            .expect("connect");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+        (Repo::new(pool), node)
+    }
+
+    #[tokio::test]
+    async fn user_lifecycle_soft_delete_restore() {
+        let (repo, _node) = setup().await;
+        let id = repo.create_user("alice@test.local", "argon2$x").await.unwrap();
+        let got = repo.get_user_by_email("alice@test.local").await.unwrap().unwrap();
+        assert_eq!(got.id, id);
+        assert!(repo.is_user_active(id).await.unwrap());
+
+        repo.delete_user_event_soft(id, false, "user.deleted", "{}").await.unwrap();
+        assert!(!repo.is_user_active(id).await.unwrap(), "soft-deleted should be inactive");
+
+        repo.restore_user_event(id, "user.restored", "{}").await.unwrap();
+        assert!(repo.is_user_active(id).await.unwrap(), "restored should be active");
+    }
+
+    #[tokio::test]
+    async fn list_roles_with_permissions_single_query() {
+        let (repo, _node) = setup().await;
+        let roles = repo.list_roles_with_permissions().await.unwrap();
+        let admin = roles.iter().find(|r| r.name == "admin").expect("admin role seeded");
+        assert!(!admin.permissions.is_empty(), "admin should carry perms via the single query");
+    }
+
+    #[tokio::test]
+    async fn api_key_create_get_revoke() {
+        let (repo, _node) = setup().await;
+        let id = repo.create_user("key@test.local", "x").await.unwrap();
+        repo.create_api_key("k1", id, "hash1", "ci", &["user:read".to_string()], None)
+            .await
+            .unwrap();
+        let row = repo.get_api_key_by_hash("hash1").await.unwrap().unwrap();
+        assert_eq!(row.user_id, id);
+        assert_eq!(row.scopes, vec!["user:read".to_string()]);
+        repo.revoke_api_key("k1", id).await.unwrap();
+        let row2 = repo.get_api_key_by_hash("hash1").await.unwrap().unwrap();
+        assert!(row2.revoked_at.is_some(), "key should be revoked");
+    }
+
+    #[tokio::test]
+    async fn recovery_code_single_use() {
+        let (repo, _node) = setup().await;
+        let id = repo.create_user("rec@test.local", "x").await.unwrap();
+        repo.insert_recovery_code(id, "rc-hash").await.unwrap();
+        assert!(repo.consume_recovery_code(id, "rc-hash").await.unwrap());
+        assert!(
+            !repo.consume_recovery_code(id, "rc-hash").await.unwrap(),
+            "a recovery code must be one-time"
+        );
+    }
+}
