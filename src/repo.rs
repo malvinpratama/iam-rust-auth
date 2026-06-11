@@ -54,6 +54,17 @@ pub struct RefreshTokenRow {
     pub user_id: Uuid,
     pub expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub tenant_id: Uuid,
+    pub project_id: Option<Uuid>,
+}
+
+/// A tenant the user is an active member of (M6).
+#[derive(FromRow)]
+pub struct MembershipRow {
+    pub tenant_id: Uuid,
+    pub tenant_slug: String,
+    pub tenant_name: String,
+    pub status: String,
 }
 
 #[derive(FromRow)]
@@ -455,13 +466,18 @@ impl Repo {
         user_id: Uuid,
         token_hash: &str,
         expires_at: DateTime<Utc>,
+        tenant_id: Uuid,
+        project_id: Option<Uuid>,
     ) -> sqlx::Result<()> {
         sqlx::query(
-            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at, tenant_id, project_id) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(user_id)
         .bind(token_hash)
         .bind(expires_at)
+        .bind(tenant_id)
+        .bind(project_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -469,11 +485,60 @@ impl Repo {
 
     pub async fn get_refresh_token(&self, token_hash: &str) -> sqlx::Result<Option<RefreshTokenRow>> {
         sqlx::query_as::<_, RefreshTokenRow>(
-            "SELECT user_id, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
+            "SELECT user_id, expires_at, revoked_at, tenant_id, project_id \
+             FROM refresh_tokens WHERE token_hash = $1",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
         .await
+    }
+
+    /// M6: tenants the user is an active member of (joined to the tenant row).
+    pub async fn list_memberships(&self, user_id: Uuid) -> sqlx::Result<Vec<MembershipRow>> {
+        sqlx::query_as::<_, MembershipRow>(
+            "SELECT t.id AS tenant_id, t.slug AS tenant_slug, t.name AS tenant_name, m.status \
+             FROM memberships m JOIN tenants t ON t.id = m.tenant_id \
+             WHERE m.user_id = $1 AND m.status = 'active' AND t.status = 'active' \
+             ORDER BY t.name",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// M6: whether the user is an active member of the tenant.
+    pub async fn is_active_member(&self, user_id: Uuid, tenant_id: Uuid) -> sqlx::Result<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM memberships \
+             WHERE user_id = $1 AND tenant_id = $2 AND status = 'active')",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// M6: the default project of a tenant (lowest-sorted), if any.
+    pub async fn get_default_project(&self, tenant_id: Uuid) -> sqlx::Result<Option<Uuid>> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM projects WHERE tenant_id = $1 ORDER BY slug LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// M6: enroll a user as an active member of a tenant (idempotent).
+    pub async fn create_membership(&self, user_id: Uuid, tenant_id: Uuid) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO memberships (user_id, tenant_id, status) VALUES ($1, $2, 'active') \
+             ON CONFLICT (user_id, tenant_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn revoke_refresh_token(&self, token_hash: &str) -> sqlx::Result<()> {
