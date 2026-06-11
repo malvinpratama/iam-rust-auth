@@ -3,6 +3,7 @@ mod grpc;
 mod keys;
 mod relay;
 mod repo;
+mod saga;
 mod totp;
 
 use std::time::Duration;
@@ -47,8 +48,14 @@ async fn main() -> anyhow::Result<()> {
             let js = common::events::connect(&url).await?;
             common::events::ensure_stream(&js).await?;
             let relay_repo = repo.clone();
+            let saga_repo = repo.clone();
+            let saga_js = js.clone();
             tokio::spawn(async move { relay::run(relay_repo, js).await });
             tracing::info!(nats = %url, "outbox relay started");
+            // Saga: roll back identities whose profile creation failed permanently.
+            if let Err(e) = saga::run(saga_repo, saga_js).await {
+                tracing::warn!(error = %e, "saga compensator failed to start");
+            }
         }
         _ => tracing::warn!("NATS_URL not set — event publishing disabled"),
     }
