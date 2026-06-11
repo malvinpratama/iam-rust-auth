@@ -84,6 +84,13 @@ UPDATE refresh_tokens SET tenant_id = '00000000-0000-0000-0000-000000000001' WHE
 -- audit_events / outbox keep tenant_id NULL for historical/system rows.
 
 -- ── 5. Tighten constraints ──────────────────────────────────
+-- DEFAULT = the default tenant so existing INSERTs that don't yet pass a
+-- tenant_id keep working (land in the default tenant). Wired queries override
+-- it explicitly; the default stays as a backward-compat safety net.
+ALTER TABLE user_roles     ALTER COLUMN tenant_id SET DEFAULT '00000000-0000-0000-0000-000000000001';
+ALTER TABLE oauth_clients  ALTER COLUMN tenant_id SET DEFAULT '00000000-0000-0000-0000-000000000001';
+ALTER TABLE api_keys       ALTER COLUMN tenant_id SET DEFAULT '00000000-0000-0000-0000-000000000001';
+ALTER TABLE refresh_tokens ALTER COLUMN tenant_id SET DEFAULT '00000000-0000-0000-0000-000000000001';
 ALTER TABLE user_roles     ALTER COLUMN tenant_id SET NOT NULL;
 ALTER TABLE oauth_clients  ALTER COLUMN tenant_id SET NOT NULL;
 ALTER TABLE api_keys       ALTER COLUMN tenant_id SET NOT NULL;
