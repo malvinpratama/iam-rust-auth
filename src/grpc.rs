@@ -646,6 +646,11 @@ impl AuthService for AuthSvc {
             .await
             .map_err(|_| Status::internal("db error"))?
             .ok_or_else(|| Status::not_found("user not found"))?;
+        // Re-enrolling would reset the secret and silently disable working 2FA;
+        // require an explicit disable first.
+        if user.totp_enabled {
+            return Err(Status::failed_precondition("2FA is already enabled; disable it first"));
+        }
         let secret = crate::totp::generate(&user.email).ok_or_else(|| Status::internal("failed to generate secret"))?;
         let recovery = crate::totp::generate_recovery_codes(10);
         self.repo
@@ -665,6 +670,20 @@ impl AuthService for AuthSvc {
             otpauth_uri: secret.otpauth_uri,
             recovery_codes: recovery,
         }))
+    }
+
+    async fn get_totp_status(
+        &self,
+        request: Request<GetTotpStatusRequest>,
+    ) -> Result<Response<GetTotpStatusResponse>, Status> {
+        let uid = caller_uuid(request.metadata())?;
+        let user = self
+            .repo
+            .get_user_by_id(uid)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+            .ok_or_else(|| Status::not_found("user not found"))?;
+        Ok(Response::new(GetTotpStatusResponse { enabled: user.totp_enabled }))
     }
 
     async fn activate_totp(
