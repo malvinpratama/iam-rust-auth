@@ -1,3 +1,4 @@
+mod cache;
 mod grpc;
 mod keys;
 mod relay;
@@ -52,7 +53,15 @@ async fn main() -> anyhow::Result<()> {
         _ => tracing::warn!("NATS_URL not set — event publishing disabled"),
     }
 
-    let svc = AuthSvc::new(repo, jwt, jwt_cfg.refresh_ttl_secs, Box::new(common::email::LogSender));
+    // Optional Redis: shared access-token denylist + permission cache across
+    // replicas; falls back to Postgres/no-cache when REDIS_URL is unset.
+    let cache = cache::Cache::new(&common::env_or("REDIS_URL", "")).await;
+    if cache.enabled() {
+        tracing::info!("auth cache: redis-backed (shared denylist + permission cache)");
+    } else {
+        tracing::info!("auth cache: disabled (postgres denylist, no permission cache)");
+    }
+    let svc = AuthSvc::new(repo, jwt, jwt_cfg.refresh_ttl_secs, Box::new(common::email::LogSender), cache);
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter.set_serving::<AuthServiceServer<AuthSvc>>().await;

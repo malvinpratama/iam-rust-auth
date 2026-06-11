@@ -28,6 +28,7 @@ pub struct AuthSvc {
     refresh_ttl_secs: i64,
     dummy_hash: String, // constant-time login on unknown users
     mail: Box<dyn Sender>,
+    cache: crate::cache::Cache, // optional Redis: denylist + permission cache
 }
 
 /// Enforce a permission from the gateway-supplied identity metadata
@@ -59,9 +60,9 @@ fn verify_pkce(challenge: &str, method: &str, verifier: &str) -> bool {
 }
 
 impl AuthSvc {
-    pub fn new(repo: Repo, jwt: JwtManager, refresh_ttl_secs: i64, mail: Box<dyn Sender>) -> Self {
+    pub fn new(repo: Repo, jwt: JwtManager, refresh_ttl_secs: i64, mail: Box<dyn Sender>, cache: crate::cache::Cache) -> Self {
         let dummy_hash = password::hash("constant-time-dummy-password").unwrap_or_default();
-        Self { repo, jwt, refresh_ttl_secs, dummy_hash, mail }
+        Self { repo, jwt, refresh_ttl_secs, dummy_hash, mail, cache }
     }
 
     /// Record a sensitive action with an explicit actor.
@@ -535,6 +536,8 @@ impl AuthService for AuthSvc {
                 if let Some(exp) = chrono::DateTime::from_timestamp(claims.exp, 0) {
                     let _ = self.repo.revoke_access_jti(&claims.jti, exp).await;
                 }
+                // Mirror into the Redis denylist so other replicas reject it now.
+                self.cache.deny(&claims.jti, claims.exp - Utc::now().timestamp()).await;
             }
         }
         self.audit(&md, "auth.logout", "", "").await;
@@ -555,12 +558,17 @@ impl AuthService for AuthSvc {
         if !claims.purpose.is_empty() {
             return Err(Status::unauthenticated("invalid token"));
         }
-        if self
-            .repo
-            .is_token_revoked(&claims.jti)
-            .await
-            .map_err(|_| Status::internal("failed to check token status"))?
-        {
+        // Prefer the Redis denylist (shared across replicas); fall back to the
+        // durable Postgres denylist when Redis is off or errors.
+        let denied = match self.cache.is_denied(&claims.jti).await {
+            Some(d) => d,
+            None => self
+                .repo
+                .is_token_revoked(&claims.jti)
+                .await
+                .map_err(|_| Status::internal("failed to check token status"))?,
+        };
+        if denied {
             return Err(Status::unauthenticated("token revoked"));
         }
         let user_id =
@@ -579,11 +587,20 @@ impl AuthService for AuthSvc {
             .get_user_roles(user_id)
             .await
             .map_err(|_| Status::internal("failed to load roles"))?;
-        let permissions = self
-            .repo
-            .get_user_permissions(user_id)
-            .await
-            .map_err(|_| Status::internal("failed to load permissions"))?;
+        // Permission cache (Redis, short TTL) cuts the RBAC join off the hot
+        // path of every authenticated request; misses fall back to Postgres.
+        let permissions = match self.cache.get_perms(&claims.sub).await {
+            Some(p) => p,
+            None => {
+                let p = self
+                    .repo
+                    .get_user_permissions(user_id)
+                    .await
+                    .map_err(|_| Status::internal("failed to load permissions"))?;
+                self.cache.set_perms(&claims.sub, &p).await;
+                p
+            }
+        };
         Ok(Response::new(ValidateTokenResponse {
             user_id: claims.sub,
             email: claims.email,
@@ -994,8 +1011,42 @@ impl AuthService for AuthSvc {
             .assign_role(user_id, &req.role_name)
             .await
             .map_err(|_| Status::internal("failed to assign role"))?;
+        self.cache.invalidate_perms(&req.user_id).await;
         self.audit(&md, "role.assign", &req.user_id, &req.role_name).await;
         Ok(Response::new(AssignRoleResponse { success: true }))
+    }
+
+    async fn assign_role_bulk(
+        &self,
+        request: Request<AssignRoleBulkRequest>,
+    ) -> Result<Response<AssignRoleBulkResponse>, Status> {
+        require_perm(request.metadata(), "role:assign")?;
+        let md = request.metadata().clone();
+        let req = request.into_inner();
+        if !self
+            .repo
+            .role_exists(&req.role_name)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+        {
+            return Err(Status::not_found("role not found"));
+        }
+        let mut assigned = 0i32;
+        let mut failed = Vec::new();
+        for uid in &req.user_ids {
+            match Uuid::parse_str(uid) {
+                Ok(user_id) => match self.repo.assign_role(user_id, &req.role_name).await {
+                    Ok(_) => {
+                        self.cache.invalidate_perms(uid).await;
+                        assigned += 1;
+                    }
+                    Err(_) => failed.push(uid.clone()),
+                },
+                Err(_) => failed.push(uid.clone()),
+            }
+        }
+        self.audit(&md, "role.assign_bulk", &req.role_name, &format!("{assigned} assigned, {} failed", failed.len())).await;
+        Ok(Response::new(AssignRoleBulkResponse { assigned, failed }))
     }
 
     async fn revoke_role(
@@ -1019,6 +1070,7 @@ impl AuthService for AuthSvc {
             .revoke_role(user_id, &req.role_name)
             .await
             .map_err(|_| Status::internal("failed to revoke role"))?;
+        self.cache.invalidate_perms(&req.user_id).await;
         self.audit(&md, "role.revoke", &req.user_id, &req.role_name).await;
         Ok(Response::new(RevokeRoleResponse { success: true }))
     }
