@@ -616,28 +616,12 @@ impl AuthService for AuthSvc {
         {
             return Err(Status::unauthenticated("account is not active"));
         }
-        let roles = self
-            .repo
-            .get_user_roles(user_id)
-            .await
-            .map_err(|_| Status::internal("failed to load roles"))?;
-        // Permission cache (Redis, short TTL) cuts the RBAC join off the hot
-        // path of every authenticated request; misses fall back to Postgres.
-        let permissions = match self.cache.get_perms(&claims.sub).await {
-            Some(p) => p,
-            None => {
-                let p = self
-                    .repo
-                    .get_user_permissions(user_id)
-                    .await
-                    .map_err(|_| Status::internal("failed to load permissions"))?;
-                self.cache.set_perms(&claims.sub, &p).await;
-                p
-            }
-        };
-        // M6: a tenant-bound token is only valid while the user is still an
-        // active member of that tenant (revoking membership logs them out).
-        if !claims.tenant_id.is_empty() {
+        // M6: resolve the token's tenant/project once. A tenant-bound token is
+        // only valid while the user is still an active member (revoking
+        // membership logs them out), and RBAC is scoped to that tenant/project.
+        let tenant_uuid = if claims.tenant_id.is_empty() {
+            None
+        } else {
             let tid = Uuid::parse_str(&claims.tenant_id)
                 .map_err(|_| Status::unauthenticated("invalid tenant claim"))?;
             if !self
@@ -648,7 +632,59 @@ impl AuthService for AuthSvc {
             {
                 return Err(Status::unauthenticated("tenant membership revoked"));
             }
-        }
+            Some(tid)
+        };
+        let project_uuid = if claims.project_id.is_empty() {
+            None
+        } else {
+            Some(
+                Uuid::parse_str(&claims.project_id)
+                    .map_err(|_| Status::unauthenticated("invalid project claim"))?,
+            )
+        };
+        // M6.3: roles/permissions scoped to the token's tenant (+ optional
+        // project) — the same user can hold different roles in different
+        // tenants. A token without a tenant falls back to the global view.
+        let roles = match tenant_uuid {
+            Some(tid) => self
+                .repo
+                .get_user_roles_scoped(user_id, tid, project_uuid)
+                .await
+                .map_err(|_| Status::internal("failed to load roles"))?,
+            None => self
+                .repo
+                .get_user_roles(user_id)
+                .await
+                .map_err(|_| Status::internal("failed to load roles"))?,
+        };
+        // Permission cache (Redis, short TTL) cuts the RBAC join off the hot
+        // path of every authenticated request; misses fall back to Postgres.
+        // The key is scoped to tenant/project so a switch can't read stale perms.
+        let permissions = match self
+            .cache
+            .get_perms(&claims.tenant_id, &claims.project_id, &claims.sub)
+            .await
+        {
+            Some(p) => p,
+            None => {
+                let p = match tenant_uuid {
+                    Some(tid) => self
+                        .repo
+                        .get_user_permissions_scoped(user_id, tid, project_uuid)
+                        .await
+                        .map_err(|_| Status::internal("failed to load permissions"))?,
+                    None => self
+                        .repo
+                        .get_user_permissions(user_id)
+                        .await
+                        .map_err(|_| Status::internal("failed to load permissions"))?,
+                };
+                self.cache
+                    .set_perms(&claims.tenant_id, &claims.project_id, &claims.sub, &p)
+                    .await;
+                p
+            }
+        };
         Ok(Response::new(ValidateTokenResponse {
             user_id: claims.sub,
             email: claims.email,
