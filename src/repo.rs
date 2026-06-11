@@ -626,25 +626,44 @@ impl Repo {
         .await
     }
 
-    /// M6.4: projects in a tenant.
+    /// M6.4b: projects in a tenant, read under Row-Level Security — the query
+    /// runs in a transaction as the restricted iam_rls role with app.tenant_id
+    /// set, so Postgres enforces tenant isolation on top of the WHERE (a forgotten
+    /// filter still cannot leak another tenant's rows; the policy is fail-closed).
     pub async fn list_projects_by_tenant(&self, tenant_id: Uuid) -> sqlx::Result<Vec<ProjectRow>> {
-        sqlx::query_as::<_, ProjectRow>(
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET LOCAL ROLE iam_rls").execute(&mut *tx).await?;
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let rows = sqlx::query_as::<_, ProjectRow>(
             "SELECT id, tenant_id, slug, name FROM projects WHERE tenant_id = $1 ORDER BY name",
         )
         .bind(tenant_id)
-        .fetch_all(&self.pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 
-    /// M6.4: members of a tenant (joined to users for the email).
+    /// M6.4b: members of a tenant (joined to users), read under Row-Level Security.
     pub async fn list_members_by_tenant(&self, tenant_id: Uuid) -> sqlx::Result<Vec<MemberRow>> {
-        sqlx::query_as::<_, MemberRow>(
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET LOCAL ROLE iam_rls").execute(&mut *tx).await?;
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let rows = sqlx::query_as::<_, MemberRow>(
             "SELECT u.id AS user_id, u.email, m.status FROM memberships m \
              JOIN users u ON u.id = m.user_id WHERE m.tenant_id = $1 ORDER BY u.email",
         )
         .bind(tenant_id)
-        .fetch_all(&self.pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 
     /// M6.4: remove a user from a tenant.
