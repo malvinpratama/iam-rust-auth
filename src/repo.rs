@@ -783,6 +783,39 @@ impl Repo {
         Ok(exists)
     }
 
+    /// M6: a role visible in a tenant — its own role or a built-in template.
+    pub async fn role_in_tenant(&self, name: &str, tenant_id: Uuid) -> sqlx::Result<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM roles WHERE name = $1 AND (tenant_id = $2 OR tenant_id IS NULL))",
+        )
+        .bind(name)
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// M6: a role OWNED by the tenant (not a shared built-in template).
+    pub async fn tenant_role_exists(&self, name: &str, tenant_id: Uuid) -> sqlx::Result<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM roles WHERE name = $1 AND tenant_id = $2)",
+        )
+        .bind(name)
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// M6: whether a project belongs to a tenant.
+    pub async fn is_project_in_tenant(&self, project_id: Uuid, tenant_id: Uuid) -> sqlx::Result<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(project_id)
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub async fn assign_role(
         &self,
         user_id: Uuid,
@@ -790,9 +823,13 @@ impl Repo {
         tenant_id: Uuid,
         project_id: Option<Uuid>,
     ) -> sqlx::Result<()> {
+        // Resolve the role within the tenant (own role, else a built-in template,
+        // preferring the tenant-specific one) — never another tenant's role.
         sqlx::query(
             "INSERT INTO user_roles (user_id, role_id, tenant_id, project_id) \
-             SELECT $1, r.id, $3, $4 FROM roles r WHERE r.name = $2 ON CONFLICT DO NOTHING",
+             SELECT $1, r.id, $3, $4 FROM roles r \
+             WHERE r.name = $2 AND (r.tenant_id = $3 OR r.tenant_id IS NULL) \
+             ORDER BY r.tenant_id NULLS LAST LIMIT 1 ON CONFLICT DO NOTHING",
         )
         .bind(user_id)
         .bind(role_name)
@@ -843,29 +880,32 @@ impl Repo {
         .await
     }
 
-    pub async fn create_role(&self, name: &str, description: &str) -> sqlx::Result<RoleRow> {
+    pub async fn create_role(&self, name: &str, description: &str, tenant_id: Uuid) -> sqlx::Result<RoleRow> {
         sqlx::query_as::<_, RoleRow>(
-            "INSERT INTO roles (name, description) VALUES ($1, $2) RETURNING id, name, description",
+            "INSERT INTO roles (name, description, tenant_id) VALUES ($1, $2, $3) RETURNING id, name, description",
         )
         .bind(name)
         .bind(description)
+        .bind(tenant_id)
         .fetch_one(&self.pool)
         .await
     }
 
-    pub async fn update_role(&self, name: &str, description: &str) -> sqlx::Result<Option<RoleRow>> {
+    pub async fn update_role(&self, name: &str, description: &str, tenant_id: Uuid) -> sqlx::Result<Option<RoleRow>> {
         sqlx::query_as::<_, RoleRow>(
-            "UPDATE roles SET description = $2 WHERE name = $1 RETURNING id, name, description",
+            "UPDATE roles SET description = $2 WHERE name = $1 AND tenant_id = $3 RETURNING id, name, description",
         )
         .bind(name)
         .bind(description)
+        .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await
     }
 
-    pub async fn delete_role(&self, name: &str) -> sqlx::Result<()> {
-        sqlx::query("DELETE FROM roles WHERE name = $1")
+    pub async fn delete_role(&self, name: &str, tenant_id: Uuid) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM roles WHERE name = $1 AND tenant_id = $2")
             .bind(name)
+            .bind(tenant_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -877,17 +917,20 @@ impl Repo {
             .await
     }
 
-    /// Roles + their permission names in one query (avoids the N+1 over roles).
-    pub async fn list_roles_with_permissions(&self) -> sqlx::Result<Vec<RoleWithPermsRow>> {
+    /// M6: the tenant's own roles + the shared built-in templates, each with its
+    /// permissions in one query (avoids the N+1 over roles).
+    pub async fn list_roles_with_permissions(&self, tenant_id: Uuid) -> sqlx::Result<Vec<RoleWithPermsRow>> {
         sqlx::query_as::<_, RoleWithPermsRow>(
             "SELECT r.id, r.name, r.description, \
                     COALESCE(array_agg(p.name ORDER BY p.name) FILTER (WHERE p.name IS NOT NULL), '{}')::text[] AS permissions \
              FROM roles r \
              LEFT JOIN role_permissions rp ON rp.role_id = r.id \
              LEFT JOIN permissions p ON p.id = rp.permission_id \
+             WHERE r.tenant_id = $1 OR r.tenant_id IS NULL \
              GROUP BY r.id, r.name, r.description \
              ORDER BY r.name",
         )
+        .bind(tenant_id)
         .fetch_all(&self.pool)
         .await
     }
@@ -909,27 +952,31 @@ impl Repo {
             .await
     }
 
-    pub async fn grant_permission(&self, role_name: &str, perm_name: &str) -> sqlx::Result<()> {
+    /// M6: grant a permission to one of the TENANT's own roles (built-in
+    /// templates are platform-managed and shared, so not mutable per-tenant).
+    pub async fn grant_permission(&self, role_name: &str, perm_name: &str, tenant_id: Uuid) -> sqlx::Result<()> {
         sqlx::query(
             "INSERT INTO role_permissions (role_id, permission_id) \
              SELECT r.id, p.id FROM roles r, permissions p \
-             WHERE r.name = $1 AND p.name = $2 ON CONFLICT DO NOTHING",
+             WHERE r.name = $1 AND r.tenant_id = $3 AND p.name = $2 ON CONFLICT DO NOTHING",
         )
         .bind(role_name)
         .bind(perm_name)
+        .bind(tenant_id)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn revoke_permission(&self, role_name: &str, perm_name: &str) -> sqlx::Result<()> {
+    pub async fn revoke_permission(&self, role_name: &str, perm_name: &str, tenant_id: Uuid) -> sqlx::Result<()> {
         sqlx::query(
             "DELETE FROM role_permissions \
-             WHERE role_id = (SELECT id FROM roles WHERE name = $1) \
+             WHERE role_id = (SELECT id FROM roles WHERE name = $1 AND tenant_id = $3) \
                AND permission_id = (SELECT id FROM permissions WHERE name = $2)",
         )
         .bind(role_name)
         .bind(perm_name)
+        .bind(tenant_id)
         .execute(&self.pool)
         .await?;
         Ok(())
