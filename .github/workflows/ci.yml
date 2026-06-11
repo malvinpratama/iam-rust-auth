@@ -18,6 +18,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo build --release
       - run: cargo test
+      # Integration tests against a real Postgres via testcontainers (Docker is
+      # available on ubuntu-latest runners).
+      - run: cargo test --features integration
 
   image:
     needs: test
