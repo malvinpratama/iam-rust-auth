@@ -573,6 +573,49 @@ impl Repo {
         .await
     }
 
+    /// M6.3: roles scoped to the token's tenant (and optional project).
+    /// Tenant-wide assignments (project_id IS NULL) always apply; project-scoped
+    /// ones apply only when the token names that project. A NULL project_id
+    /// (tenant-wide token) therefore yields only tenant-wide roles.
+    pub async fn get_user_roles_scoped(
+        &self,
+        user_id: Uuid,
+        tenant_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> sqlx::Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id \
+             WHERE ur.user_id = $1 AND ur.tenant_id = $2 \
+               AND (ur.project_id IS NULL OR ur.project_id = $3) ORDER BY r.name",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// M6.3: permissions scoped to the token's tenant (and optional project).
+    pub async fn get_user_permissions_scoped(
+        &self,
+        user_id: Uuid,
+        tenant_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> sqlx::Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT p.name FROM user_roles ur \
+             JOIN role_permissions rp ON rp.role_id = ur.role_id \
+             JOIN permissions p ON p.id = rp.permission_id \
+             WHERE ur.user_id = $1 AND ur.tenant_id = $2 \
+               AND (ur.project_id IS NULL OR ur.project_id = $3) ORDER BY p.name",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub async fn role_exists(&self, name: &str) -> sqlx::Result<bool> {
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM roles WHERE name = $1)")
