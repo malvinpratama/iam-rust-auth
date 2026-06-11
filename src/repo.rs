@@ -64,6 +64,14 @@ pub struct RoleRow {
 }
 
 #[derive(FromRow)]
+pub struct RoleWithPermsRow {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub permissions: Vec<String>,
+}
+
+#[derive(FromRow)]
 pub struct OutboxRow {
     pub id: Uuid,
     pub event_type: String,
@@ -565,6 +573,21 @@ impl Repo {
         sqlx::query_as::<_, RoleRow>("SELECT id, name, description FROM roles ORDER BY name")
             .fetch_all(&self.pool)
             .await
+    }
+
+    /// Roles + their permission names in one query (avoids the N+1 over roles).
+    pub async fn list_roles_with_permissions(&self) -> sqlx::Result<Vec<RoleWithPermsRow>> {
+        sqlx::query_as::<_, RoleWithPermsRow>(
+            "SELECT r.id, r.name, r.description, \
+                    COALESCE(array_agg(p.name ORDER BY p.name) FILTER (WHERE p.name IS NOT NULL), '{}')::text[] AS permissions \
+             FROM roles r \
+             LEFT JOIN role_permissions rp ON rp.role_id = r.id \
+             LEFT JOIN permissions p ON p.id = rp.permission_id \
+             GROUP BY r.id, r.name, r.description \
+             ORDER BY r.name",
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn list_role_permissions(&self, role_id: i64) -> sqlx::Result<Vec<String>> {

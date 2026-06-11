@@ -987,25 +987,21 @@ impl AuthService for AuthSvc {
         &self,
         _request: Request<ListRolesRequest>,
     ) -> Result<Response<ListRolesResponse>, Status> {
+        // Single query (roles LEFT JOIN their permissions, aggregated) — no N+1.
         let rows = self
             .repo
-            .list_roles()
+            .list_roles_with_permissions()
             .await
             .map_err(|_| Status::internal("failed to list roles"))?;
-        let mut roles = Vec::with_capacity(rows.len());
-        for r in rows {
-            let perms = self
-                .repo
-                .list_role_permissions(r.id)
-                .await
-                .map_err(|_| Status::internal("failed to list role permissions"))?;
-            roles.push(Role {
+        let roles = rows
+            .into_iter()
+            .map(|r| Role {
                 id: r.id,
                 name: r.name,
                 description: r.description,
-                permissions: perms,
-            });
-        }
+                permissions: r.permissions,
+            })
+            .collect();
         Ok(Response::new(ListRolesResponse { roles }))
     }
 
