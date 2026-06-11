@@ -129,7 +129,11 @@ async fn bootstrap_admin(repo: &Repo) -> anyhow::Result<()> {
     }
     let hash = common::password::hash(&pass)
         .map_err(|e| anyhow::anyhow!("hash admin password: {e}"))?;
-    repo.create_user_with_role(&email, &hash, "admin").await?;
+    let id = repo.create_user_with_role(&email, &hash, "admin").await?;
+    // M6: the bootstrap admin is a member of the default tenant.
+    let default_tenant =
+        uuid::Uuid::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    repo.create_membership(id, default_tenant).await?;
     tracing::info!(email, "bootstrap admin created");
     Ok(())
 }

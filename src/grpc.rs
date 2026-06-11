@@ -22,6 +22,11 @@ use crate::repo::Repo;
 
 const DEFAULT_ROLE: &str = "user";
 
+/// M6: the seeded default tenant every legacy/new identity belongs to until
+/// explicitly enrolled elsewhere. Shared, fixed UUID across both stacks.
+const DEFAULT_TENANT_ID: Uuid =
+    Uuid::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
 pub struct AuthSvc {
     repo: Repo,
     jwt: JwtManager,
@@ -79,15 +84,25 @@ impl AuthSvc {
         self.audit_as(&actor_id, &actor_email, action, target, detail).await;
     }
 
-    async fn issue_tokens(&self, user_id: Uuid, email: &str) -> Result<TokenPair, Status> {
+    /// M6: mint a token pair bound to a specific (tenant, project). The binding
+    /// is carried in the access-token claims and persisted on the refresh row so
+    /// a later Refresh keeps the same tenant/project.
+    async fn issue_tokens(
+        &self,
+        user_id: Uuid,
+        email: &str,
+        tenant_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<TokenPair, Status> {
+        let proj_str = project_id.map(|p| p.to_string()).unwrap_or_default();
         let access = self
             .jwt
-            .issue(&user_id.to_string(), email)
+            .issue(&user_id.to_string(), email, &tenant_id.to_string(), &proj_str)
             .map_err(|_| Status::internal("failed to sign token"))?;
         let refresh = gen_refresh_token();
         let expires = Utc::now() + Duration::seconds(self.refresh_ttl_secs);
         self.repo
-            .create_refresh_token(user_id, &hash_token(&refresh), expires)
+            .create_refresh_token(user_id, &hash_token(&refresh), expires, tenant_id, project_id)
             .await
             .map_err(|_| Status::internal("failed to persist refresh token"))?;
         Ok(TokenPair {
@@ -98,6 +113,18 @@ impl AuthSvc {
             mfa_required: false,
             mfa_token: String::new(),
         })
+    }
+
+    /// M6: pick the user's active tenant (first active membership; default
+    /// tenant as a fallback) and mint a tenant-wide token pair for it.
+    async fn issue_for_active_tenant(&self, user_id: Uuid, email: &str) -> Result<TokenPair, Status> {
+        let members = self
+            .repo
+            .list_memberships(user_id)
+            .await
+            .map_err(|_| Status::internal("failed to load memberships"))?;
+        let tenant_id = members.first().map(|m| m.tenant_id).unwrap_or(DEFAULT_TENANT_ID);
+        self.issue_tokens(user_id, email, tenant_id, None).await
     }
 }
 
@@ -314,7 +341,7 @@ impl AuthService for AuthSvc {
             .await
             .map_err(|_| Status::internal("user lookup failed"))?;
 
-        let tp = self.issue_tokens(user_id, &email).await?;
+        let tp = self.issue_for_active_tenant(user_id, &email).await?;
         let issuer = common::env_or("OIDC_ISSUER", "http://localhost:8080");
         let id_token = self
             .jwt
@@ -401,6 +428,10 @@ impl AuthService for AuthSvc {
             )
             .await
             .map_err(|_| Status::already_exists("email already registered"))?;
+        // M6: enroll the new identity into the default tenant so it has a home
+        // organization (user_roles already default to it; this makes the
+        // membership explicit for /me/memberships and the switcher).
+        let _ = self.repo.create_membership(id, DEFAULT_TENANT_ID).await;
         self.audit_as(&id.to_string(), &req.email, "user.register", "", "").await;
         Ok(Response::new(RegisterResponse {
             user_id: id.to_string(),
@@ -480,7 +511,7 @@ impl AuthService for AuthSvc {
         }
 
         self.audit_as(&user.id.to_string(), &user.email, "login.success", "", "").await;
-        let pair = self.issue_tokens(user.id, &user.email).await?;
+        let pair = self.issue_for_active_tenant(user.id, &user.email).await?;
         Ok(Response::new(pair))
     }
 
@@ -516,7 +547,10 @@ impl AuthService for AuthSvc {
             .revoke_refresh_token(&hash)
             .await
             .map_err(|_| Status::internal("failed to rotate token"))?;
-        let pair = self.issue_tokens(user.id, &user.email).await?;
+        // M6: keep the original token's tenant/project binding across refresh.
+        let pair = self
+            .issue_tokens(user.id, &user.email, row.tenant_id, row.project_id)
+            .await?;
         Ok(Response::new(pair))
     }
 
@@ -601,12 +635,89 @@ impl AuthService for AuthSvc {
                 p
             }
         };
+        // M6: a tenant-bound token is only valid while the user is still an
+        // active member of that tenant (revoking membership logs them out).
+        if !claims.tenant_id.is_empty() {
+            let tid = Uuid::parse_str(&claims.tenant_id)
+                .map_err(|_| Status::unauthenticated("invalid tenant claim"))?;
+            if !self
+                .repo
+                .is_active_member(user_id, tid)
+                .await
+                .map_err(|_| Status::internal("failed to check membership"))?
+            {
+                return Err(Status::unauthenticated("tenant membership revoked"));
+            }
+        }
         Ok(Response::new(ValidateTokenResponse {
             user_id: claims.sub,
             email: claims.email,
             roles,
             permissions,
+            tenant_id: claims.tenant_id,
+            project_id: claims.project_id,
         }))
+    }
+
+    // M6: tenants the caller is an active member of (drives the console switcher).
+    #[tracing::instrument(skip_all)]
+    async fn list_my_memberships(
+        &self,
+        request: Request<ListMembershipsRequest>,
+    ) -> Result<Response<ListMembershipsResponse>, Status> {
+        let caller = caller_uuid(request.metadata())?;
+        let rows = self
+            .repo
+            .list_memberships(caller)
+            .await
+            .map_err(|_| Status::internal("failed to load memberships"))?;
+        let memberships = rows
+            .into_iter()
+            .map(|m| Membership {
+                tenant_id: m.tenant_id.to_string(),
+                tenant_slug: m.tenant_slug,
+                tenant_name: m.tenant_name,
+                status: m.status,
+            })
+            .collect();
+        Ok(Response::new(ListMembershipsResponse { memberships }))
+    }
+
+    // M6: re-issue a fresh token pair bound to another tenant/project the caller
+    // belongs to, without revoking the current one (concurrent sessions).
+    #[tracing::instrument(skip_all)]
+    async fn switch_tenant(
+        &self,
+        request: Request<SwitchTenantRequest>,
+    ) -> Result<Response<TokenPair>, Status> {
+        let caller = caller_uuid(request.metadata())?;
+        let req = request.into_inner();
+        let tenant_id = Uuid::parse_str(&req.tenant_id)
+            .map_err(|_| Status::invalid_argument("invalid tenant id"))?;
+        if !self
+            .repo
+            .is_active_member(caller, tenant_id)
+            .await
+            .map_err(|_| Status::internal("failed to check membership"))?
+        {
+            return Err(Status::permission_denied("not a member of that tenant"));
+        }
+        let project_id = if req.project_id.is_empty() {
+            None
+        } else {
+            Some(
+                Uuid::parse_str(&req.project_id)
+                    .map_err(|_| Status::invalid_argument("invalid project id"))?,
+            )
+        };
+        let user = self
+            .repo
+            .get_user_by_id(caller)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+            .ok_or_else(|| Status::unauthenticated("user not found"))?;
+        let pair = self.issue_tokens(caller, &user.email, tenant_id, project_id).await?;
+        Ok(Response::new(pair))
     }
 
     #[tracing::instrument(skip_all)]
@@ -772,7 +883,7 @@ impl AuthService for AuthSvc {
             return Err(Status::unauthenticated("invalid code"));
         }
         self.audit_as(&uid.to_string(), &user.email, "login.success", "", "2fa").await;
-        let pair = self.issue_tokens(uid, &user.email).await?;
+        let pair = self.issue_for_active_tenant(uid, &user.email).await?;
         Ok(Response::new(pair))
     }
 
