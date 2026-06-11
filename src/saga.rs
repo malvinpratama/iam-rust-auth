@@ -1,11 +1,12 @@
-//! Registration compensation: when the user service gives up creating a profile
-//! (ProfileCreationFailed), auth soft-deletes the half-created identity so
-//! registration leaves no orphans.
+//! Handles permanently-failed profile creation. When the user service gives up
+//! (ProfileCreationFailed), auth records the incident for ops visibility but
+//! keeps the identity active — the profile is recreated by lazy-heal on the next
+//! GET /users/me, so the user is never locked out (forward recovery, not a
+//! destructive rollback).
 
 use async_nats::jetstream::{
     self,
     consumer::{pull, AckPolicy, PullConsumer},
-    AckKind,
 };
 use futures::StreamExt;
 use uuid::Uuid;
@@ -54,24 +55,18 @@ async fn consume(repo: Repo, consumer: PullConsumer) {
                 }
             };
             match serde_json::from_slice::<common::events::ProfileCreationFailed>(&msg.payload) {
-                Ok(ev) => match Uuid::parse_str(&ev.user_id) {
-                    Ok(uid) => match repo.soft_delete_user(uid).await {
-                        Ok(_) => {
-                            let _ = repo
-                                .insert_audit("system", "saga", "saga.profile_failed.compensated", &ev.user_id, &ev.reason)
-                                .await;
-                            let _ = msg.ack().await;
-                            tracing::warn!(user_id = %ev.user_id, reason = %ev.reason, "compensated half-created identity (soft-deleted)");
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "compensation failed; will retry");
-                            let _ = msg.ack_with(AckKind::Nak(None)).await;
-                        }
-                    },
-                    Err(_) => {
-                        let _ = msg.ack().await;
+                Ok(ev) => {
+                    if Uuid::parse_str(&ev.user_id).is_ok() {
+                        // Forward recovery, not rollback: keep the identity
+                        // active and record the failure. The profile is recreated
+                        // by lazy-heal on the next GET /users/me.
+                        let _ = repo
+                            .insert_audit("system", "saga", "profile.creation_failed", &ev.user_id, &ev.reason)
+                            .await;
+                        tracing::warn!(user_id = %ev.user_id, reason = %ev.reason, "profile creation failed permanently; identity kept active, profile will self-heal on next /users/me read");
                     }
-                },
+                    let _ = msg.ack().await;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "bad ProfileCreationFailed payload");
                     let _ = msg.ack().await;
