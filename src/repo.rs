@@ -94,6 +94,14 @@ pub struct MemberRow {
     pub status: String,
 }
 
+/// A user's role assignment within a tenant (M6) — project_* NULL = tenant-wide.
+#[derive(FromRow)]
+pub struct RoleAssignmentRow {
+    pub role: String,
+    pub project_id: Option<Uuid>,
+    pub project_slug: Option<String>,
+}
+
 #[derive(FromRow)]
 pub struct RoleRow {
     pub id: i64,
@@ -775,28 +783,64 @@ impl Repo {
         Ok(exists)
     }
 
-    pub async fn assign_role(&self, user_id: Uuid, role_name: &str) -> sqlx::Result<()> {
+    pub async fn assign_role(
+        &self,
+        user_id: Uuid,
+        role_name: &str,
+        tenant_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> sqlx::Result<()> {
         sqlx::query(
-            "INSERT INTO user_roles (user_id, role_id) \
-             SELECT $1, r.id FROM roles r WHERE r.name = $2 ON CONFLICT DO NOTHING",
+            "INSERT INTO user_roles (user_id, role_id, tenant_id, project_id) \
+             SELECT $1, r.id, $3, $4 FROM roles r WHERE r.name = $2 ON CONFLICT DO NOTHING",
         )
         .bind(user_id)
         .bind(role_name)
+        .bind(tenant_id)
+        .bind(project_id)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn revoke_role(&self, user_id: Uuid, role_name: &str) -> sqlx::Result<()> {
+    pub async fn revoke_role(
+        &self,
+        user_id: Uuid,
+        role_name: &str,
+        tenant_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> sqlx::Result<()> {
         sqlx::query(
-            "DELETE FROM user_roles \
-             WHERE user_id = $1 AND role_id = (SELECT id FROM roles WHERE name = $2)",
+            "DELETE FROM user_roles ur \
+             WHERE ur.user_id = $1 AND ur.role_id = (SELECT r.id FROM roles r WHERE r.name = $2) \
+               AND ur.tenant_id = $3 AND ur.project_id IS NOT DISTINCT FROM $4",
         )
         .bind(user_id)
         .bind(role_name)
+        .bind(tenant_id)
+        .bind(project_id)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// M6: a user's role assignments in a tenant, each with its project scope.
+    pub async fn get_user_role_assignments(
+        &self,
+        user_id: Uuid,
+        tenant_id: Uuid,
+    ) -> sqlx::Result<Vec<RoleAssignmentRow>> {
+        sqlx::query_as::<_, RoleAssignmentRow>(
+            "SELECT r.name AS role, ur.project_id, p.slug AS project_slug \
+             FROM user_roles ur JOIN roles r ON r.id = ur.role_id \
+             LEFT JOIN projects p ON p.id = ur.project_id \
+             WHERE ur.user_id = $1 AND ur.tenant_id = $2 \
+             ORDER BY r.name, p.slug NULLS FIRST",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn create_role(&self, name: &str, description: &str) -> sqlx::Result<RoleRow> {
