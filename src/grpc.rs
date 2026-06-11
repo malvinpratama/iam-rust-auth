@@ -152,6 +152,17 @@ fn caller_uuid(md: &MetadataMap) -> Result<Uuid, Status> {
         .map_err(|_| Status::unauthenticated("missing or invalid caller identity"))
 }
 
+/// Parse an optional project id from a request field (empty = tenant-wide).
+fn parse_opt_project(s: &str) -> Result<Option<Uuid>, Status> {
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Uuid::parse_str(s)
+            .map(Some)
+            .map_err(|_| Status::invalid_argument("invalid project id"))
+    }
+}
+
 /// M6.4: the tenant the caller's token is bound to (forwarded by the gateway as
 /// x-tenant-id). Tenant-scoped admin operations act within it.
 fn active_tenant(md: &MetadataMap) -> Result<Uuid, Status> {
@@ -1356,6 +1367,7 @@ impl AuthService for AuthSvc {
         request: Request<AssignRoleRequest>,
     ) -> Result<Response<AssignRoleResponse>, Status> {
         require_perm(request.metadata(), "role:assign")?;
+        let tenant = active_tenant(request.metadata())?;
         let md = request.metadata().clone();
         let req = request.into_inner();
         let user_id = Uuid::parse_str(&req.user_id)
@@ -1368,8 +1380,9 @@ impl AuthService for AuthSvc {
         {
             return Err(Status::not_found("role not found"));
         }
+        let project = parse_opt_project(&req.project_id)?;
         self.repo
-            .assign_role(user_id, &req.role_name)
+            .assign_role(user_id, &req.role_name, tenant, project)
             .await
             .map_err(|_| Status::internal("failed to assign role"))?;
         self.cache.invalidate_perms(&req.user_id).await;
@@ -1382,6 +1395,7 @@ impl AuthService for AuthSvc {
         request: Request<AssignRoleBulkRequest>,
     ) -> Result<Response<AssignRoleBulkResponse>, Status> {
         require_perm(request.metadata(), "role:assign")?;
+        let tenant = active_tenant(request.metadata())?;
         let md = request.metadata().clone();
         let req = request.into_inner();
         if !self
@@ -1392,11 +1406,12 @@ impl AuthService for AuthSvc {
         {
             return Err(Status::not_found("role not found"));
         }
+        let project = parse_opt_project(&req.project_id)?;
         let mut assigned = 0i32;
         let mut failed = Vec::new();
         for uid in &req.user_ids {
             match Uuid::parse_str(uid) {
-                Ok(user_id) => match self.repo.assign_role(user_id, &req.role_name).await {
+                Ok(user_id) => match self.repo.assign_role(user_id, &req.role_name, tenant, project).await {
                     Ok(_) => {
                         self.cache.invalidate_perms(uid).await;
                         assigned += 1;
@@ -1415,6 +1430,7 @@ impl AuthService for AuthSvc {
         request: Request<RevokeRoleRequest>,
     ) -> Result<Response<RevokeRoleResponse>, Status> {
         require_perm(request.metadata(), "role:assign")?;
+        let tenant = active_tenant(request.metadata())?;
         let md = request.metadata().clone();
         let req = request.into_inner();
         let user_id = Uuid::parse_str(&req.user_id)
@@ -1427,13 +1443,40 @@ impl AuthService for AuthSvc {
         {
             return Err(Status::not_found("role not found"));
         }
+        let project = parse_opt_project(&req.project_id)?;
         self.repo
-            .revoke_role(user_id, &req.role_name)
+            .revoke_role(user_id, &req.role_name, tenant, project)
             .await
             .map_err(|_| Status::internal("failed to revoke role"))?;
         self.cache.invalidate_perms(&req.user_id).await;
         self.audit(&md, "role.revoke", &req.user_id, &req.role_name).await;
         Ok(Response::new(RevokeRoleResponse { success: true }))
+    }
+
+    // M6: a user's role assignments in the active tenant (role + project scope).
+    async fn get_user_role_assignments(
+        &self,
+        request: Request<GetUserRoleAssignmentsRequest>,
+    ) -> Result<Response<GetUserRoleAssignmentsResponse>, Status> {
+        require_perm(request.metadata(), "role:read")?;
+        let tenant = active_tenant(request.metadata())?;
+        let req = request.into_inner();
+        let user_id = Uuid::parse_str(&req.user_id)
+            .map_err(|_| Status::invalid_argument("invalid user id"))?;
+        let rows = self
+            .repo
+            .get_user_role_assignments(user_id, tenant)
+            .await
+            .map_err(|_| Status::internal("failed to load role assignments"))?;
+        let assignments = rows
+            .into_iter()
+            .map(|r| RoleAssignment {
+                role: r.role,
+                project_id: r.project_id.map(|p| p.to_string()).unwrap_or_default(),
+                project_slug: r.project_slug.unwrap_or_default(),
+            })
+            .collect();
+        Ok(Response::new(GetUserRoleAssignmentsResponse { assignments }))
     }
 
     async fn list_permissions(
