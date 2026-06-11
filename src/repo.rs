@@ -54,6 +54,7 @@ pub struct RefreshTokenRow {
     pub user_id: Uuid,
     pub expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub replaced_by: Option<String>,
     pub tenant_id: Uuid,
     pub project_id: Option<Uuid>,
 }
@@ -64,6 +65,32 @@ pub struct MembershipRow {
     pub tenant_id: Uuid,
     pub tenant_slug: String,
     pub tenant_name: String,
+    pub status: String,
+}
+
+/// A tenant row (M6.4 administration).
+#[derive(FromRow)]
+pub struct TenantRow {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub status: String,
+}
+
+/// A project row (M6.4 administration).
+#[derive(FromRow)]
+pub struct ProjectRow {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub slug: String,
+    pub name: String,
+}
+
+/// A tenant member (M6.4 administration).
+#[derive(FromRow)]
+pub struct MemberRow {
+    pub user_id: Uuid,
+    pub email: String,
     pub status: String,
 }
 
@@ -485,7 +512,7 @@ impl Repo {
 
     pub async fn get_refresh_token(&self, token_hash: &str) -> sqlx::Result<Option<RefreshTokenRow>> {
         sqlx::query_as::<_, RefreshTokenRow>(
-            "SELECT user_id, expires_at, revoked_at, tenant_id, project_id \
+            "SELECT user_id, expires_at, revoked_at, replaced_by, tenant_id, project_id \
              FROM refresh_tokens WHERE token_hash = $1",
         )
         .bind(token_hash)
@@ -541,11 +568,115 @@ impl Repo {
         Ok(())
     }
 
+    /// M6.4: create a tenant and, in the same transaction, enroll the creator as
+    /// its first member and grant them the admin role scoped to it (their
+    /// platform role does not carry over — RBAC is per tenant).
+    pub async fn create_tenant_with_admin(
+        &self,
+        slug: &str,
+        name: &str,
+        creator: Uuid,
+    ) -> sqlx::Result<TenantRow> {
+        let mut tx = self.pool.begin().await?;
+        let t = sqlx::query_as::<_, TenantRow>(
+            "INSERT INTO tenants (slug, name) VALUES ($1, $2) RETURNING id, slug, name, status",
+        )
+        .bind(slug)
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO memberships (user_id, tenant_id, status) VALUES ($1, $2, 'active') \
+             ON CONFLICT (user_id, tenant_id) DO NOTHING",
+        )
+        .bind(creator)
+        .bind(t.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_roles (user_id, role_id, tenant_id) \
+             SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'admin' AND r.tenant_id IS NULL \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(creator)
+        .bind(t.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(t)
+    }
+
+    /// M6.4: every tenant (platform view).
+    pub async fn list_tenants(&self) -> sqlx::Result<Vec<TenantRow>> {
+        sqlx::query_as::<_, TenantRow>("SELECT id, slug, name, status FROM tenants ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// M6.4: create a project in a tenant.
+    pub async fn create_project(&self, tenant_id: Uuid, slug: &str, name: &str) -> sqlx::Result<ProjectRow> {
+        sqlx::query_as::<_, ProjectRow>(
+            "INSERT INTO projects (tenant_id, slug, name) VALUES ($1, $2, $3) \
+             RETURNING id, tenant_id, slug, name",
+        )
+        .bind(tenant_id)
+        .bind(slug)
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// M6.4: projects in a tenant.
+    pub async fn list_projects_by_tenant(&self, tenant_id: Uuid) -> sqlx::Result<Vec<ProjectRow>> {
+        sqlx::query_as::<_, ProjectRow>(
+            "SELECT id, tenant_id, slug, name FROM projects WHERE tenant_id = $1 ORDER BY name",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// M6.4: members of a tenant (joined to users for the email).
+    pub async fn list_members_by_tenant(&self, tenant_id: Uuid) -> sqlx::Result<Vec<MemberRow>> {
+        sqlx::query_as::<_, MemberRow>(
+            "SELECT u.id AS user_id, u.email, m.status FROM memberships m \
+             JOIN users u ON u.id = m.user_id WHERE m.tenant_id = $1 ORDER BY u.email",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// M6.4: remove a user from a tenant.
+    pub async fn remove_member(&self, user_id: Uuid, tenant_id: Uuid) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM memberships WHERE user_id = $1 AND tenant_id = $2")
+            .bind(user_id)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn revoke_refresh_token(&self, token_hash: &str) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
         )
         .bind(token_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a token rotated (revoked) and record its successor, so a concurrent
+    /// re-presentation within the grace window is told apart from a logout-revoked
+    /// token (which leaves replaced_by NULL).
+    pub async fn rotate_refresh_token(&self, token_hash: &str, replaced_by: &str) -> sqlx::Result<()> {
+        sqlx::query(
+            "UPDATE refresh_tokens SET revoked_at = now(), replaced_by = $2 \
+             WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .bind(replaced_by)
         .execute(&self.pool)
         .await?;
         Ok(())
