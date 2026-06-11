@@ -27,6 +27,12 @@ const DEFAULT_ROLE: &str = "user";
 const DEFAULT_TENANT_ID: Uuid =
     Uuid::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 
+/// How long after a refresh token is rotated a concurrent re-presentation is
+/// still treated as the benign parallel-refresh race (re-issue) rather than
+/// theft (family wipe). Short enough to bound replay; long enough to absorb a
+/// client firing several requests at once.
+const REFRESH_ROTATION_GRACE_SECS: i64 = 60;
+
 pub struct AuthSvc {
     repo: Repo,
     jwt: JwtManager,
@@ -144,6 +150,16 @@ fn caller_perms(md: &MetadataMap) -> Vec<String> {
 fn caller_uuid(md: &MetadataMap) -> Result<Uuid, Status> {
     Uuid::parse_str(&meta(md, "x-user-id"))
         .map_err(|_| Status::unauthenticated("missing or invalid caller identity"))
+}
+
+/// M6.4: the tenant the caller's token is bound to (forwarded by the gateway as
+/// x-tenant-id). Tenant-scoped admin operations act within it.
+fn active_tenant(md: &MetadataMap) -> Result<Uuid, Status> {
+    let t = meta(md, "x-tenant-id");
+    if t.is_empty() {
+        return Err(Status::failed_precondition("no active tenant on token"));
+    }
+    Uuid::parse_str(&t).map_err(|_| Status::internal("invalid active tenant"))
 }
 
 #[tonic::async_trait]
@@ -527,8 +543,26 @@ impl AuthService for AuthSvc {
             .await
             .map_err(|_| Status::internal("db error"))?
             .ok_or_else(|| Status::unauthenticated("invalid refresh token"))?;
-        if row.revoked_at.is_some() {
-            // Reuse of an already-revoked token suggests theft → revoke the family.
+        if let Some(revoked_at) = row.revoked_at {
+            // A token revoked by *rotation* (replaced_by set) re-presented within
+            // the grace window is the benign concurrent-refresh race (e.g. NextAuth
+            // firing several requests after the access token expires) — re-issue
+            // instead of treating it as theft.
+            let rotated = row.replaced_by.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+            if rotated && (Utc::now() - revoked_at) < Duration::seconds(REFRESH_ROTATION_GRACE_SECS) {
+                let user = self
+                    .repo
+                    .get_user_by_id(row.user_id)
+                    .await
+                    .map_err(|_| Status::internal("db error"))?
+                    .ok_or_else(|| Status::unauthenticated("user not found"))?;
+                let pair = self
+                    .issue_tokens(user.id, &user.email, row.tenant_id, row.project_id)
+                    .await?;
+                return Ok(Response::new(pair));
+            }
+            // Otherwise (logout-revoked, or rotated outside the grace) genuine reuse
+            // suggests theft → revoke the whole token family.
             let _ = self.repo.revoke_all_user_refresh_tokens(row.user_id).await;
             self.audit_as(&row.user_id.to_string(), "", "refresh.reuse_detected", "", "all sessions revoked").await;
             return Err(Status::unauthenticated("refresh token revoked"));
@@ -542,15 +576,14 @@ impl AuthService for AuthSvc {
             .await
             .map_err(|_| Status::internal("db error"))?
             .ok_or_else(|| Status::unauthenticated("user not found"))?;
-        // Rotate: revoke the presented token, issue a fresh pair.
-        self.repo
-            .revoke_refresh_token(&hash)
-            .await
-            .map_err(|_| Status::internal("failed to rotate token"))?;
-        // M6: keep the original token's tenant/project binding across refresh.
+        // Rotate: issue the fresh pair (keeping the tenant/project binding), then
+        // mark the presented token rotated and point it at its successor so a
+        // concurrent re-presentation hits the grace path above, not the family wipe.
         let pair = self
             .issue_tokens(user.id, &user.email, row.tenant_id, row.project_id)
             .await?;
+        let successor = hash_token(&pair.refresh_token);
+        let _ = self.repo.rotate_refresh_token(&hash, &successor).await;
         Ok(Response::new(pair))
     }
 
@@ -754,6 +787,153 @@ impl AuthService for AuthSvc {
             .ok_or_else(|| Status::unauthenticated("user not found"))?;
         let pair = self.issue_tokens(caller, &user.email, tenant_id, project_id).await?;
         Ok(Response::new(pair))
+    }
+
+    // ── M6.4: tenant / project / member administration ──────────
+
+    #[tracing::instrument(skip_all)]
+    async fn create_tenant(
+        &self,
+        request: Request<CreateTenantRequest>,
+    ) -> Result<Response<Tenant>, Status> {
+        require_perm(request.metadata(), "tenant:write")?;
+        let caller = caller_uuid(request.metadata())?;
+        let req = request.into_inner();
+        if req.slug.is_empty() || req.name.is_empty() {
+            return Err(Status::invalid_argument("slug and name are required"));
+        }
+        let t = self
+            .repo
+            .create_tenant_with_admin(&req.slug, &req.name, caller)
+            .await
+            .map_err(|_| Status::already_exists("tenant slug already taken"))?;
+        self.audit_as(&caller.to_string(), "", "tenant.create", &t.id.to_string(), &req.slug).await;
+        Ok(Response::new(Tenant { id: t.id.to_string(), slug: t.slug, name: t.name, status: t.status }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn list_tenants(
+        &self,
+        request: Request<ListTenantsRequest>,
+    ) -> Result<Response<ListTenantsResponse>, Status> {
+        require_perm(request.metadata(), "tenant:read")?;
+        let rows = self
+            .repo
+            .list_tenants()
+            .await
+            .map_err(|_| Status::internal("failed to list tenants"))?;
+        let tenants = rows
+            .into_iter()
+            .map(|t| Tenant { id: t.id.to_string(), slug: t.slug, name: t.name, status: t.status })
+            .collect();
+        Ok(Response::new(ListTenantsResponse { tenants }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn create_project(
+        &self,
+        request: Request<CreateProjectRequest>,
+    ) -> Result<Response<Project>, Status> {
+        require_perm(request.metadata(), "project:write")?;
+        let tenant = active_tenant(request.metadata())?;
+        let req = request.into_inner();
+        if req.slug.is_empty() || req.name.is_empty() {
+            return Err(Status::invalid_argument("slug and name are required"));
+        }
+        let p = self
+            .repo
+            .create_project(tenant, &req.slug, &req.name)
+            .await
+            .map_err(|_| Status::already_exists("project slug already taken in this tenant"))?;
+        Ok(Response::new(Project {
+            id: p.id.to_string(),
+            tenant_id: p.tenant_id.to_string(),
+            slug: p.slug,
+            name: p.name,
+        }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn list_projects(
+        &self,
+        request: Request<ListProjectsRequest>,
+    ) -> Result<Response<ListProjectsResponse>, Status> {
+        require_perm(request.metadata(), "project:read")?;
+        let tenant = active_tenant(request.metadata())?;
+        let rows = self
+            .repo
+            .list_projects_by_tenant(tenant)
+            .await
+            .map_err(|_| Status::internal("failed to list projects"))?;
+        let projects = rows
+            .into_iter()
+            .map(|p| Project {
+                id: p.id.to_string(),
+                tenant_id: p.tenant_id.to_string(),
+                slug: p.slug,
+                name: p.name,
+            })
+            .collect();
+        Ok(Response::new(ListProjectsResponse { projects }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn add_member(
+        &self,
+        request: Request<AddMemberRequest>,
+    ) -> Result<Response<Member>, Status> {
+        require_perm(request.metadata(), "member:write")?;
+        let tenant = active_tenant(request.metadata())?;
+        let req = request.into_inner();
+        let user = self
+            .repo
+            .get_user_by_email(&req.email)
+            .await
+            .map_err(|_| Status::internal("user lookup failed"))?
+            .ok_or_else(|| Status::not_found("no user with that email"))?;
+        self.repo
+            .create_membership(user.id, tenant)
+            .await
+            .map_err(|_| Status::internal("could not add member"))?;
+        self.audit_as(&user.id.to_string(), &user.email, "member.add", &tenant.to_string(), "").await;
+        Ok(Response::new(Member { user_id: user.id.to_string(), email: user.email, status: "active".into() }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn remove_member(
+        &self,
+        request: Request<RemoveMemberRequest>,
+    ) -> Result<Response<RemoveMemberResponse>, Status> {
+        require_perm(request.metadata(), "member:write")?;
+        let tenant = active_tenant(request.metadata())?;
+        let req = request.into_inner();
+        let uid = Uuid::parse_str(&req.user_id)
+            .map_err(|_| Status::invalid_argument("invalid user id"))?;
+        self.repo
+            .remove_member(uid, tenant)
+            .await
+            .map_err(|_| Status::internal("could not remove member"))?;
+        self.audit_as(&req.user_id, "", "member.remove", &tenant.to_string(), "").await;
+        Ok(Response::new(RemoveMemberResponse { success: true }))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn list_members(
+        &self,
+        request: Request<ListMembersRequest>,
+    ) -> Result<Response<ListMembersResponse>, Status> {
+        require_perm(request.metadata(), "member:read")?;
+        let tenant = active_tenant(request.metadata())?;
+        let rows = self
+            .repo
+            .list_members_by_tenant(tenant)
+            .await
+            .map_err(|_| Status::internal("failed to list members"))?;
+        let members = rows
+            .into_iter()
+            .map(|m| Member { user_id: m.user_id.to_string(), email: m.email, status: m.status })
+            .collect();
+        Ok(Response::new(ListMembersResponse { members }))
     }
 
     #[tracing::instrument(skip_all)]
