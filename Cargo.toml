@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 common = { git = "https://github.com/malvinpratama/iam-rust-common", tag = "v0.10.0" }
-proto = { git = "https://github.com/malvinpratama/iam-rust-proto", tag = "v0.11.0" }
+proto = { git = "https://github.com/malvinpratama/iam-rust-proto", tag = "v0.13.0" }
 tokio = { version = "1", features = ["full"] }
 tonic = "0.14"
 tonic-health = "0.14"
