@@ -40,6 +40,7 @@ pub struct AuthSvc {
     dummy_hash: String, // constant-time login on unknown users
     mail: Box<dyn Sender>,
     cache: crate::cache::Cache, // optional Redis: denylist + permission cache
+    totp_enc: crate::totpsecret::Encryptor, // encrypts TOTP shared secrets at rest (TS3)
 }
 
 /// Enforce a permission from the gateway-supplied identity metadata
@@ -71,9 +72,9 @@ fn verify_pkce(challenge: &str, method: &str, verifier: &str) -> bool {
 }
 
 impl AuthSvc {
-    pub fn new(repo: Repo, jwt: JwtManager, refresh_ttl_secs: i64, mail: Box<dyn Sender>, cache: crate::cache::Cache) -> Self {
+    pub fn new(repo: Repo, jwt: JwtManager, refresh_ttl_secs: i64, mail: Box<dyn Sender>, cache: crate::cache::Cache, totp_enc: crate::totpsecret::Encryptor) -> Self {
         let dummy_hash = password::hash("constant-time-dummy-password").unwrap_or_default();
-        Self { repo, jwt, refresh_ttl_secs, dummy_hash, mail, cache }
+        Self { repo, jwt, refresh_ttl_secs, dummy_hash, mail, cache, totp_enc }
     }
 
     /// Record a sensitive action with an explicit actor. `tenant` stamps the row
@@ -1093,8 +1094,14 @@ impl AuthService for AuthSvc {
         }
         let secret = crate::totp::generate(&user.email).ok_or_else(|| Status::internal("failed to generate secret"))?;
         let recovery = crate::totp::generate_recovery_codes(10);
+        // Encrypt the shared secret before it touches the DB (TS3). The plaintext
+        // is still returned to the caller below to add to their authenticator.
+        let stored = self
+            .totp_enc
+            .encrypt(&secret.base32)
+            .map_err(|_| Status::internal("failed to encrypt secret"))?;
         self.repo
-            .set_totp_secret(uid, &secret.base32)
+            .set_totp_secret(uid, &stored)
             .await
             .map_err(|_| Status::internal("failed to store secret"))?;
         let _ = self.repo.delete_recovery_codes(uid).await;
@@ -1140,6 +1147,7 @@ impl AuthService for AuthSvc {
             .map_err(|_| Status::internal("db error"))?
             .ok_or_else(|| Status::not_found("user not found"))?;
         let secret = user.totp_secret.ok_or_else(|| Status::failed_precondition("no pending enrollment; call EnrollTotp first"))?;
+        let secret = self.totp_enc.decrypt(&secret).map_err(|_| Status::internal("failed to read secret"))?;
         if !crate::totp::validate(&req.code, &secret) {
             return Err(Status::unauthenticated("invalid code"));
         }
@@ -1164,7 +1172,12 @@ impl AuthService for AuthSvc {
         if !user.totp_enabled {
             return Ok(Response::new(GenericResponse { success: true }));
         }
-        let ok = user.totp_secret.as_deref().map(|s| crate::totp::validate(&req.code, s)).unwrap_or(false);
+        let ok = user
+            .totp_secret
+            .as_deref()
+            .and_then(|s| self.totp_enc.decrypt(s).ok())
+            .map(|plain| crate::totp::validate(&req.code, &plain))
+            .unwrap_or(false);
         let ok = ok
             || self
                 .repo
@@ -1208,6 +1221,7 @@ impl AuthService for AuthSvc {
             }
         }
         let secret = user.totp_secret.clone().unwrap();
+        let secret = self.totp_enc.decrypt(&secret).unwrap_or_default();
         let ok = crate::totp::validate(&req.code, &secret)
             || self
                 .repo
