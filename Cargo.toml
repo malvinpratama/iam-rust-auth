@@ -20,6 +20,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+aes-gcm = "0.10"
 hex = "0.4"
 rand = "0.8"
 totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
@@ -28,6 +29,10 @@ base64 = "0.22"
 tracing = "0.1"
 anyhow = "1"
 async-nats = "0.37"
+# Pin away from time 0.3.48, which adds a From<HourBase> impl that conflicts with
+# async-nats 0.37's macros (E0119). No Cargo.lock is tracked, so a fresh resolve
+# otherwise picks the broken version. Drop once async-nats is upgraded.
+time = "=0.3.47"
 serde_json = "1"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 futures = "0.3"

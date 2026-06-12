@@ -5,6 +5,7 @@ mod relay;
 mod repo;
 mod saga;
 mod totp;
+mod totpsecret;
 
 use std::time::Duration;
 
@@ -68,7 +69,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("auth cache: disabled (postgres denylist, no permission cache)");
     }
-    let svc = AuthSvc::new(repo, jwt, jwt_cfg.refresh_ttl_secs, Box::new(common::email::LogSender), cache);
+    // TS3: encrypt TOTP shared secrets at rest. Without TOTP_ENC_KEY this is a
+    // passthrough (plaintext, as before) so dev/CI keep working; production sets it.
+    let totp_enc = totpsecret::Encryptor::new(&common::env_or("TOTP_ENC_KEY", ""));
+    if totp_enc.enabled() {
+        tracing::info!("totp secrets: encrypted at rest (AES-256-GCM)");
+    } else {
+        tracing::warn!("totp secrets: plaintext at rest — set TOTP_ENC_KEY to encrypt");
+    }
+    let svc = AuthSvc::new(repo, jwt, jwt_cfg.refresh_ttl_secs, Box::new(common::email::LogSender), cache, totp_enc);
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter.set_serving::<AuthServiceServer<AuthSvc>>().await;
