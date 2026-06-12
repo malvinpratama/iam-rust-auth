@@ -298,6 +298,23 @@ impl AuthService for AuthSvc {
         let req = request.into_inner();
         let user_id =
             Uuid::parse_str(&req.user_id).map_err(|_| Status::invalid_argument("invalid user id"))?;
+        // Only mint a code for a member of the client's organization. The exchange
+        // re-checks this, but gating at issuance means a non-member can't drive the
+        // authorize/consent flow to a usable code at all.
+        let client_tenant: Uuid = sqlx::query_scalar("SELECT tenant_id FROM oauth_clients WHERE client_id = $1")
+            .bind(&req.client_id)
+            .fetch_optional(&self.repo.pool)
+            .await
+            .map_err(|_| Status::internal("client lookup failed"))?
+            .ok_or_else(|| Status::not_found("client not found"))?;
+        if !self
+            .repo
+            .is_active_member(user_id, client_tenant)
+            .await
+            .map_err(|_| Status::internal("membership check failed"))?
+        {
+            return Err(Status::permission_denied("not a member of this client's organization"));
+        }
         let mut b = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut b);
         let code = URL_SAFE_NO_PAD.encode(b);
@@ -861,10 +878,19 @@ impl AuthService for AuthSvc {
         let project_id = if req.project_id.is_empty() {
             None
         } else {
-            Some(
-                Uuid::parse_str(&req.project_id)
-                    .map_err(|_| Status::invalid_argument("invalid project id"))?,
-            )
+            let pid = Uuid::parse_str(&req.project_id)
+                .map_err(|_| Status::invalid_argument("invalid project id"))?;
+            // The project must belong to the tenant being switched into, else the
+            // re-issued token would carry a cross-tenant project_id claim.
+            if !self
+                .repo
+                .is_project_in_tenant(pid, tenant_id)
+                .await
+                .map_err(|_| Status::internal("project check failed"))?
+            {
+                return Err(Status::invalid_argument("project does not belong to this tenant"));
+            }
+            Some(pid)
         };
         let user = self
             .repo
