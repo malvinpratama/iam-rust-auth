@@ -132,6 +132,54 @@ impl AuthSvc {
         let tenant_id = members.first().map(|m| m.tenant_id).unwrap_or(DEFAULT_TENANT_ID);
         self.issue_tokens(user_id, email, tenant_id, None).await
     }
+
+    /// M6: validate a role assignment for the active tenant — the role must be
+    /// visible in the tenant (own role or built-in template) and any named
+    /// project must belong to the tenant. Returns the parsed project id.
+    async fn validate_assign(
+        &self,
+        role_name: &str,
+        project_id: &str,
+        tenant: Uuid,
+    ) -> Result<Option<Uuid>, Status> {
+        if !self
+            .repo
+            .role_in_tenant(role_name, tenant)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+        {
+            return Err(Status::not_found("role not found in this tenant"));
+        }
+        let project = parse_opt_project(project_id)?;
+        if let Some(pid) = project {
+            if !self
+                .repo
+                .is_project_in_tenant(pid, tenant)
+                .await
+                .map_err(|_| Status::internal("db error"))?
+            {
+                return Err(Status::invalid_argument("project does not belong to this tenant"));
+            }
+        }
+        Ok(project)
+    }
+
+    /// M6: a permission grant/revoke may only target the tenant's OWN role —
+    /// built-in templates are platform-managed and shared across tenants.
+    async fn perm_role_guard(&self, role_name: &str, tenant: Uuid) -> Result<(), Status> {
+        if is_builtin_role(role_name) {
+            return Err(Status::failed_precondition("cannot modify a built-in role's permissions"));
+        }
+        if !self
+            .repo
+            .tenant_role_exists(role_name, tenant)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+        {
+            return Err(Status::not_found("role not found in this tenant"));
+        }
+        Ok(())
+    }
 }
 
 /// Short-lived TTL for the token issued between the password and TOTP steps.
@@ -150,6 +198,12 @@ fn caller_perms(md: &MetadataMap) -> Vec<String> {
 fn caller_uuid(md: &MetadataMap) -> Result<Uuid, Status> {
     Uuid::parse_str(&meta(md, "x-user-id"))
         .map_err(|_| Status::unauthenticated("missing or invalid caller identity"))
+}
+
+/// Built-in role templates (tenant_id IS NULL) shared across tenants — they are
+/// platform-managed and must not be mutated from a tenant context.
+fn is_builtin_role(name: &str) -> bool {
+    name == "admin" || name == "user"
 }
 
 /// Parse an optional project id from a request field (empty = tenant-wide).
@@ -1278,11 +1332,18 @@ impl AuthService for AuthSvc {
         request: Request<CreateRoleRequest>,
     ) -> Result<Response<Role>, Status> {
         require_perm(request.metadata(), "role:write")?;
+        let tenant = active_tenant(request.metadata())?;
         let md = request.metadata().clone();
         let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("role name is required"));
+        }
+        if is_builtin_role(&req.name) {
+            return Err(Status::failed_precondition("name reserved for a built-in role"));
+        }
         let role = self
             .repo
-            .create_role(&req.name, &req.description)
+            .create_role(&req.name, &req.description, tenant)
             .await
             .map_err(|_| Status::already_exists("role already exists"))?;
         self.audit(&md, "role.create", &req.name, "").await;
@@ -1299,13 +1360,17 @@ impl AuthService for AuthSvc {
         request: Request<UpdateRoleRequest>,
     ) -> Result<Response<Role>, Status> {
         require_perm(request.metadata(), "role:write")?;
+        let tenant = active_tenant(request.metadata())?;
         let req = request.into_inner();
+        if is_builtin_role(&req.name) {
+            return Err(Status::failed_precondition("cannot modify a built-in role"));
+        }
         let role = self
             .repo
-            .update_role(&req.name, &req.description)
+            .update_role(&req.name, &req.description, tenant)
             .await
             .map_err(|_| Status::internal("db error"))?
-            .ok_or_else(|| Status::not_found("role not found"))?;
+            .ok_or_else(|| Status::not_found("role not found in this tenant"))?;
         Ok(Response::new(Role {
             id: role.id,
             name: role.name,
@@ -1319,21 +1384,22 @@ impl AuthService for AuthSvc {
         request: Request<DeleteRoleRequest>,
     ) -> Result<Response<DeleteRoleResponse>, Status> {
         require_perm(request.metadata(), "role:write")?;
+        let tenant = active_tenant(request.metadata())?;
         let md = request.metadata().clone();
         let req = request.into_inner();
-        if req.name == "admin" || req.name == "user" {
-            return Err(Status::failed_precondition("cannot delete built-in role"));
+        if is_builtin_role(&req.name) {
+            return Err(Status::failed_precondition("cannot delete a built-in role"));
         }
         if !self
             .repo
-            .role_exists(&req.name)
+            .tenant_role_exists(&req.name, tenant)
             .await
             .map_err(|_| Status::internal("db error"))?
         {
-            return Err(Status::not_found("role not found"));
+            return Err(Status::not_found("role not found in this tenant"));
         }
         self.repo
-            .delete_role(&req.name)
+            .delete_role(&req.name, tenant)
             .await
             .map_err(|_| Status::internal("failed to delete role"))?;
         self.audit(&md, "role.delete", &req.name, "").await;
@@ -1342,12 +1408,14 @@ impl AuthService for AuthSvc {
 
     async fn list_roles(
         &self,
-        _request: Request<ListRolesRequest>,
+        request: Request<ListRolesRequest>,
     ) -> Result<Response<ListRolesResponse>, Status> {
-        // Single query (roles LEFT JOIN their permissions, aggregated) — no N+1.
+        require_perm(request.metadata(), "role:read")?;
+        let tenant = active_tenant(request.metadata())?;
+        // The tenant's own roles + shared built-in templates, aggregated — no N+1.
         let rows = self
             .repo
-            .list_roles_with_permissions()
+            .list_roles_with_permissions(tenant)
             .await
             .map_err(|_| Status::internal("failed to list roles"))?;
         let roles = rows
@@ -1372,15 +1440,7 @@ impl AuthService for AuthSvc {
         let req = request.into_inner();
         let user_id = Uuid::parse_str(&req.user_id)
             .map_err(|_| Status::invalid_argument("invalid user id"))?;
-        if !self
-            .repo
-            .role_exists(&req.role_name)
-            .await
-            .map_err(|_| Status::internal("db error"))?
-        {
-            return Err(Status::not_found("role not found"));
-        }
-        let project = parse_opt_project(&req.project_id)?;
+        let project = self.validate_assign(&req.role_name, &req.project_id, tenant).await?;
         self.repo
             .assign_role(user_id, &req.role_name, tenant, project)
             .await
@@ -1398,15 +1458,7 @@ impl AuthService for AuthSvc {
         let tenant = active_tenant(request.metadata())?;
         let md = request.metadata().clone();
         let req = request.into_inner();
-        if !self
-            .repo
-            .role_exists(&req.role_name)
-            .await
-            .map_err(|_| Status::internal("db error"))?
-        {
-            return Err(Status::not_found("role not found"));
-        }
-        let project = parse_opt_project(&req.project_id)?;
+        let project = self.validate_assign(&req.role_name, &req.project_id, tenant).await?;
         let mut assigned = 0i32;
         let mut failed = Vec::new();
         for uid in &req.user_ids {
@@ -1481,8 +1533,9 @@ impl AuthService for AuthSvc {
 
     async fn list_permissions(
         &self,
-        _request: Request<ListPermissionsRequest>,
+        request: Request<ListPermissionsRequest>,
     ) -> Result<Response<ListPermissionsResponse>, Status> {
+        require_perm(request.metadata(), "role:read")?;
         let rows = self
             .repo
             .list_permissions()
@@ -1504,10 +1557,12 @@ impl AuthService for AuthSvc {
         request: Request<GrantPermissionRequest>,
     ) -> Result<Response<GrantPermissionResponse>, Status> {
         require_perm(request.metadata(), "role:write")?;
+        let tenant = active_tenant(request.metadata())?;
         let md = request.metadata().clone();
         let req = request.into_inner();
+        self.perm_role_guard(&req.role_name, tenant).await?;
         self.repo
-            .grant_permission(&req.role_name, &req.permission_name)
+            .grant_permission(&req.role_name, &req.permission_name, tenant)
             .await
             .map_err(|_| Status::internal("failed to grant permission"))?;
         self.audit(&md, "permission.grant", &req.role_name, &req.permission_name).await;
@@ -1519,10 +1574,12 @@ impl AuthService for AuthSvc {
         request: Request<RevokePermissionRequest>,
     ) -> Result<Response<RevokePermissionResponse>, Status> {
         require_perm(request.metadata(), "role:write")?;
+        let tenant = active_tenant(request.metadata())?;
         let md = request.metadata().clone();
         let req = request.into_inner();
+        self.perm_role_guard(&req.role_name, tenant).await?;
         self.repo
-            .revoke_permission(&req.role_name, &req.permission_name)
+            .revoke_permission(&req.role_name, &req.permission_name, tenant)
             .await
             .map_err(|_| Status::internal("failed to revoke permission"))?;
         self.audit(&md, "permission.revoke", &req.role_name, &req.permission_name).await;
