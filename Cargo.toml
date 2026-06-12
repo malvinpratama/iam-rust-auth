@@ -29,6 +29,10 @@ base64 = "0.22"
 tracing = "0.1"
 anyhow = "1"
 async-nats = "0.37"
+# Pin away from time 0.3.48, which adds a From<HourBase> impl that conflicts with
+# async-nats 0.37's macros (E0119). No Cargo.lock is tracked, so a fresh resolve
+# otherwise picks the broken version. Drop once async-nats is upgraded.
+time = "=0.3.47"
 serde_json = "1"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 futures = "0.3"
