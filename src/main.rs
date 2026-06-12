@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let repo = Repo::new(pool);
     bootstrap_admin(&repo).await?;
     bootstrap_oidc_client(&repo).await?;
+    bootstrap_demo(&repo).await?;
 
     // Outbox relay → NATS JetStream. Optional: without NATS_URL events are still
     // recorded; the gateway's lazy profile healing keeps the system working.
@@ -147,6 +148,28 @@ async fn bootstrap_admin(repo: &Repo) -> anyhow::Result<()> {
         uuid::Uuid::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     repo.create_membership(id, default_tenant).await?;
     tracing::info!(email, "bootstrap admin created");
+    Ok(())
+}
+
+// Read-only demo account for the public demo so anyone can sign in and look
+// around without being able to change anything. Assigned the built-in "viewer"
+// role (every *:read permission, seeded by migration 0015). Idempotent.
+async fn bootstrap_demo(repo: &Repo) -> anyhow::Result<()> {
+    let email = common::env_or("DEMO_EMAIL", "demo@iam.local");
+    let pass = common::env_or("DEMO_PASSWORD", "demo1234");
+    if email.is_empty() || pass.is_empty() {
+        return Ok(());
+    }
+    if repo.get_user_by_email(&email).await?.is_some() {
+        return Ok(());
+    }
+    let hash = common::password::hash(&pass)
+        .map_err(|e| anyhow::anyhow!("hash demo password: {e}"))?;
+    let id = repo.create_user_with_role(&email, &hash, "viewer").await?;
+    let default_tenant =
+        uuid::Uuid::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    repo.create_membership(id, default_tenant).await?;
+    tracing::info!(email, "bootstrap demo created");
     Ok(())
 }
 
