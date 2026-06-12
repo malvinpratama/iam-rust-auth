@@ -61,7 +61,7 @@ async fn consume(repo: Repo, consumer: PullConsumer) {
                         // active and record the failure. The profile is recreated
                         // by lazy-heal on the next GET /users/me.
                         let _ = repo
-                            .insert_audit("system", "saga", "profile.creation_failed", &ev.user_id, &ev.reason)
+                            .insert_audit("system", "saga", "profile.creation_failed", &ev.user_id, &ev.reason, None)
                             .await;
                         tracing::warn!(user_id = %ev.user_id, reason = %ev.reason, "profile creation failed permanently; identity kept active, profile will self-heal on next /users/me read");
                     }

@@ -76,18 +76,21 @@ impl AuthSvc {
         Self { repo, jwt, refresh_ttl_secs, dummy_hash, mail, cache }
     }
 
-    /// Record a sensitive action with an explicit actor.
-    async fn audit_as(&self, actor_id: &str, actor_email: &str, action: &str, target: &str, detail: &str) {
+    /// Record a sensitive action with an explicit actor. `tenant` stamps the row
+    /// so each organization's audit trail is isolated; `None` marks a pre-tenant
+    /// or platform event (login/register/tenant-create) that no tenant view shows.
+    async fn audit_as(&self, actor_id: &str, actor_email: &str, action: &str, target: &str, detail: &str, tenant: Option<Uuid>) {
         if common::config::audit_enabled() {
-            let _ = self.repo.insert_audit(actor_id, actor_email, action, target, detail).await;
+            let _ = self.repo.insert_audit(actor_id, actor_email, action, target, detail, tenant).await;
         }
     }
 
-    /// Record a sensitive action with the actor taken from gateway metadata.
+    /// Record a sensitive action with the actor + active tenant taken from gateway
+    /// metadata (the tenant the caller's token is bound to).
     async fn audit(&self, md: &MetadataMap, action: &str, target: &str, detail: &str) {
         let actor_id = meta(md, "x-user-id");
         let actor_email = meta(md, "x-user-email");
-        self.audit_as(&actor_id, &actor_email, action, target, detail).await;
+        self.audit_as(&actor_id, &actor_email, action, target, detail, active_tenant(md).ok()).await;
     }
 
     /// M6: mint a token pair bound to a specific (tenant, project). The binding
@@ -532,7 +535,7 @@ impl AuthService for AuthSvc {
         // organization (user_roles already default to it; this makes the
         // membership explicit for /me/memberships and the switcher).
         let _ = self.repo.create_membership(id, DEFAULT_TENANT_ID).await;
-        self.audit_as(&id.to_string(), &req.email, "user.register", "", "").await;
+        self.audit_as(&id.to_string(), &req.email, "user.register", "", "", None).await;
         Ok(Response::new(RegisterResponse {
             user_id: id.to_string(),
             email: req.email,
@@ -573,11 +576,11 @@ impl AuthService for AuthSvc {
                     if (n as i64) >= max {
                         let until = Utc::now() + Duration::seconds(common::config::login_lockout_secs());
                         let _ = self.repo.lock_user(user.id, until).await;
-                        self.audit_as(&user.id.to_string(), &user.email, "login.locked", "", "too many failed attempts").await;
+                        self.audit_as(&user.id.to_string(), &user.email, "login.locked", "", "too many failed attempts", None).await;
                     }
                 }
             }
-            self.audit_as(&user.id.to_string(), &user.email, "login.failure", "", "").await;
+            self.audit_as(&user.id.to_string(), &user.email, "login.failure", "", "", None).await;
             return Err(Status::unauthenticated("invalid credentials"));
         }
 
@@ -595,7 +598,7 @@ impl AuthService for AuthSvc {
         // 2FA: when TOTP is enabled, issue a short-lived MFA token; the client
         // completes login via LoginTotp with a TOTP or recovery code.
         if user.totp_enabled {
-            self.audit_as(&user.id.to_string(), &user.email, "login.mfa_challenge", "", "").await;
+            self.audit_as(&user.id.to_string(), &user.email, "login.mfa_challenge", "", "", None).await;
             let mfa = self
                 .jwt
                 .issue_mfa(&user.id.to_string(), MFA_TOKEN_TTL_SECS)
@@ -610,7 +613,7 @@ impl AuthService for AuthSvc {
             }));
         }
 
-        self.audit_as(&user.id.to_string(), &user.email, "login.success", "", "").await;
+        self.audit_as(&user.id.to_string(), &user.email, "login.success", "", "", None).await;
         let pair = self.issue_for_active_tenant(user.id, &user.email).await?;
         Ok(Response::new(pair))
     }
@@ -648,7 +651,7 @@ impl AuthService for AuthSvc {
             // Otherwise (logout-revoked, or rotated outside the grace) genuine reuse
             // suggests theft → revoke the whole token family.
             let _ = self.repo.revoke_all_user_refresh_tokens(row.user_id).await;
-            self.audit_as(&row.user_id.to_string(), "", "refresh.reuse_detected", "", "all sessions revoked").await;
+            self.audit_as(&row.user_id.to_string(), "", "refresh.reuse_detected", "", "all sessions revoked", None).await;
             return Err(Status::unauthenticated("refresh token revoked"));
         }
         if row.expires_at < Utc::now() {
@@ -891,7 +894,7 @@ impl AuthService for AuthSvc {
             .create_tenant_with_admin(&req.slug, &req.name, caller)
             .await
             .map_err(|_| Status::already_exists("tenant slug already taken"))?;
-        self.audit_as(&caller.to_string(), "", "tenant.create", &t.id.to_string(), &req.slug).await;
+        self.audit_as(&caller.to_string(), "", "tenant.create", &t.id.to_string(), &req.slug, None).await;
         Ok(Response::new(Tenant { id: t.id.to_string(), slug: t.slug, name: t.name, status: t.status }))
     }
 
@@ -979,7 +982,7 @@ impl AuthService for AuthSvc {
             .create_membership(user.id, tenant)
             .await
             .map_err(|_| Status::internal("could not add member"))?;
-        self.audit_as(&user.id.to_string(), &user.email, "member.add", &tenant.to_string(), "").await;
+        self.audit_as(&user.id.to_string(), &user.email, "member.add", &tenant.to_string(), "", Some(tenant)).await;
         Ok(Response::new(Member { user_id: user.id.to_string(), email: user.email, status: "active".into() }))
     }
 
@@ -997,7 +1000,7 @@ impl AuthService for AuthSvc {
             .remove_member(uid, tenant)
             .await
             .map_err(|_| Status::internal("could not remove member"))?;
-        self.audit_as(&req.user_id, "", "member.remove", &tenant.to_string(), "").await;
+        self.audit_as(&req.user_id, "", "member.remove", &tenant.to_string(), "", Some(tenant)).await;
         Ok(Response::new(RemoveMemberResponse { success: true }))
     }
 
@@ -1179,10 +1182,10 @@ impl AuthService for AuthSvc {
                 .await
                 .map_err(|_| Status::internal("db error"))?;
         if !ok {
-            self.audit_as(&uid.to_string(), &user.email, "login.mfa_failure", "", "").await;
+            self.audit_as(&uid.to_string(), &user.email, "login.mfa_failure", "", "", None).await;
             return Err(Status::unauthenticated("invalid code"));
         }
-        self.audit_as(&uid.to_string(), &user.email, "login.success", "", "2fa").await;
+        self.audit_as(&uid.to_string(), &user.email, "login.success", "", "2fa", None).await;
         let pair = self.issue_for_active_tenant(uid, &user.email).await?;
         Ok(Response::new(pair))
     }
@@ -1213,8 +1216,12 @@ impl AuthService for AuthSvc {
         } else {
             None
         };
+        // Bind the key to the tenant (+ optional project) it is minted in, so its
+        // effective permissions can never exceed the owner's access in that tenant.
+        let tenant = active_tenant(&md)?;
+        let project = parse_opt_project(&meta(&md, "x-project-id"))?;
         self.repo
-            .create_api_key(&key_id, uid, &hash_token(&full), &req.name, &req.scopes, expires)
+            .create_api_key(&key_id, uid, &hash_token(&full), &req.name, &req.scopes, expires, tenant, project)
             .await
             .map_err(|_| Status::internal("failed to create api key"))?;
         self.audit(&md, "apikey.create", &key_id, &req.name).await;
@@ -1292,10 +1299,21 @@ impl AuthService for AuthSvc {
             .map_err(|_| Status::internal("db error"))?
             .filter(|u| u.deleted_at.is_none())
             .ok_or_else(|| Status::unauthenticated("invalid api key"))?;
-        // Effective scopes = key scopes ∩ the owner's current permissions.
+        // The key only carries the permissions its owner still holds in the tenant
+        // it was minted in; if that membership (or tenant) was deactivated the key
+        // is dead. This stops a key from granting cross-tenant or stale access.
+        let member = self
+            .repo
+            .is_active_member(row.user_id, row.tenant_id)
+            .await
+            .map_err(|_| Status::internal("db error"))?;
+        if !member {
+            return Err(Status::unauthenticated("api key tenant membership revoked"));
+        }
+        // Effective scopes = key scopes ∩ the owner's permissions in that tenant.
         let perms = self
             .repo
-            .get_user_permissions(row.user_id)
+            .get_user_permissions_scoped(row.user_id, row.tenant_id, row.project_id)
             .await
             .map_err(|_| Status::internal("failed to load permissions"))?;
         let scopes: Vec<String> = row.scopes.into_iter().filter(|s| perms.contains(s)).collect();
@@ -1605,7 +1623,7 @@ impl AuthService for AuthSvc {
             .await
             .map_err(|_| Status::internal("failed to create verification"))?;
         self.mail.send(&user.email, "Verify your email", &format!("Your email verification token: {token}"));
-        self.audit_as(&user.id.to_string(), &user.email, "email.verification_requested", "", "").await;
+        self.audit_as(&user.id.to_string(), &user.email, "email.verification_requested", "", "", None).await;
         if !common::config::is_production() {
             resp.dev_token = token;
         }
@@ -1627,7 +1645,7 @@ impl AuthService for AuthSvc {
             .mark_email_verified(uid)
             .await
             .map_err(|_| Status::internal("failed to verify email"))?;
-        self.audit_as(&uid.to_string(), "", "email.verified", "", "").await;
+        self.audit_as(&uid.to_string(), "", "email.verified", "", "", None).await;
         Ok(Response::new(GenericResponse { success: true }))
     }
 
@@ -1648,7 +1666,7 @@ impl AuthService for AuthSvc {
             .await
             .map_err(|_| Status::internal("failed to create reset token"))?;
         self.mail.send(&user.email, "Reset your password", &format!("Your password reset token: {token}"));
-        self.audit_as(&user.id.to_string(), &user.email, "password.reset_requested", "", "").await;
+        self.audit_as(&user.id.to_string(), &user.email, "password.reset_requested", "", "", None).await;
         if !common::config::is_production() {
             resp.dev_token = token;
         }
@@ -1675,7 +1693,7 @@ impl AuthService for AuthSvc {
             .await
             .map_err(|_| Status::internal("failed to update password"))?;
         let _ = self.repo.revoke_all_user_refresh_tokens(uid).await;
-        self.audit_as(&uid.to_string(), "", "password.reset", "", "").await;
+        self.audit_as(&uid.to_string(), "", "password.reset", "", "", None).await;
         Ok(Response::new(GenericResponse { success: true }))
     }
 
@@ -1686,6 +1704,7 @@ impl AuthService for AuthSvc {
         request: Request<ListAuditEventsRequest>,
     ) -> Result<Response<ListAuditEventsResponse>, Status> {
         require_perm(request.metadata(), "audit:read")?;
+        let tenant = active_tenant(request.metadata())?;
         let req = request.into_inner();
         let mut limit = req.limit as i64;
         if limit <= 0 || limit > 200 {
@@ -1693,7 +1712,7 @@ impl AuthService for AuthSvc {
         }
         let rows = self
             .repo
-            .list_audit(limit)
+            .list_audit(tenant, limit)
             .await
             .map_err(|_| Status::internal("failed to list audit events"))?;
         let events = rows
