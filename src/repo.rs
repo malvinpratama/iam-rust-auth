@@ -26,6 +26,8 @@ pub struct ApiKeyRow {
     pub scopes: Vec<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub tenant_id: Uuid,
+    pub project_id: Option<Uuid>,
 }
 
 #[derive(FromRow)]
@@ -286,15 +288,15 @@ impl Repo {
 
     // ── API keys (v0.9) ──
 
-    pub async fn create_api_key(&self, id: &str, user_id: Uuid, key_hash: &str, name: &str, scopes: &[String], expires_at: Option<DateTime<Utc>>) -> sqlx::Result<()> {
-        sqlx::query("INSERT INTO api_keys (id, user_id, key_hash, name, scopes, expires_at) VALUES ($1, $2, $3, $4, $5, $6)")
-            .bind(id).bind(user_id).bind(key_hash).bind(name).bind(scopes).bind(expires_at)
+    pub async fn create_api_key(&self, id: &str, user_id: Uuid, key_hash: &str, name: &str, scopes: &[String], expires_at: Option<DateTime<Utc>>, tenant_id: Uuid, project_id: Option<Uuid>) -> sqlx::Result<()> {
+        sqlx::query("INSERT INTO api_keys (id, user_id, key_hash, name, scopes, expires_at, tenant_id, project_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
+            .bind(id).bind(user_id).bind(key_hash).bind(name).bind(scopes).bind(expires_at).bind(tenant_id).bind(project_id)
             .execute(&self.pool).await?;
         Ok(())
     }
 
     pub async fn get_api_key_by_hash(&self, key_hash: &str) -> sqlx::Result<Option<ApiKeyRow>> {
-        sqlx::query_as::<_, ApiKeyRow>("SELECT id, user_id, scopes, expires_at, revoked_at FROM api_keys WHERE key_hash = $1")
+        sqlx::query_as::<_, ApiKeyRow>("SELECT id, user_id, scopes, expires_at, revoked_at, tenant_id, project_id FROM api_keys WHERE key_hash = $1")
             .bind(key_hash).fetch_optional(&self.pool).await
     }
 
@@ -458,18 +460,21 @@ impl Repo {
         .await
     }
 
-    pub async fn insert_audit(&self, actor_id: &str, actor_email: &str, action: &str, target: &str, detail: &str) -> sqlx::Result<()> {
-        sqlx::query("INSERT INTO audit_events (actor_id, actor_email, action, target, detail) VALUES ($1, $2, $3, $4, $5)")
-            .bind(actor_id).bind(actor_email).bind(action).bind(target).bind(detail)
+    pub async fn insert_audit(&self, actor_id: &str, actor_email: &str, action: &str, target: &str, detail: &str, tenant_id: Option<Uuid>) -> sqlx::Result<()> {
+        sqlx::query("INSERT INTO audit_events (actor_id, actor_email, action, target, detail, tenant_id) VALUES ($1, $2, $3, $4, $5, $6)")
+            .bind(actor_id).bind(actor_email).bind(action).bind(target).bind(detail).bind(tenant_id)
             .execute(&self.pool).await?;
         Ok(())
     }
 
-    pub async fn list_audit(&self, limit: i64) -> sqlx::Result<Vec<AuditRow>> {
+    /// List the audit trail of a single tenant. Pre-tenant rows (login/register)
+    /// carry a NULL tenant_id and are excluded from every tenant view by design.
+    pub async fn list_audit(&self, tenant_id: Uuid, limit: i64) -> sqlx::Result<Vec<AuditRow>> {
         sqlx::query_as::<_, AuditRow>(
             "SELECT id, actor_id, actor_email, action, target, detail, created_at \
-             FROM audit_events ORDER BY id DESC LIMIT $1",
+             FROM audit_events WHERE tenant_id = $1 ORDER BY id DESC LIMIT $2",
         )
+        .bind(tenant_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -541,11 +546,15 @@ impl Repo {
         .await
     }
 
-    /// M6: whether the user is an active member of the tenant.
+    /// M6: whether the user is an active member of an active tenant. Both the
+    /// membership and the tenant must be active, so suspending a tenant
+    /// immediately invalidates every member's tokens on their next request.
     pub async fn is_active_member(&self, user_id: Uuid, tenant_id: Uuid) -> sqlx::Result<bool> {
         sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM memberships \
-             WHERE user_id = $1 AND tenant_id = $2 AND status = 'active')",
+            "SELECT EXISTS(SELECT 1 FROM memberships m \
+             JOIN tenants t ON t.id = m.tenant_id \
+             WHERE m.user_id = $1 AND m.tenant_id = $2 \
+               AND m.status = 'active' AND t.status = 'active')",
         )
         .bind(user_id)
         .bind(tenant_id)
@@ -1036,7 +1045,9 @@ mod integration {
     async fn api_key_create_get_revoke() {
         let (repo, _node) = setup().await;
         let id = repo.create_user("key@test.local", "x").await.unwrap();
-        repo.create_api_key("k1", id, "hash1", "ci", &["user:read".to_string()], None)
+        // tenant_id is a NOT-NULL FK to the seeded default tenant (M6 backfill).
+        let default_tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        repo.create_api_key("k1", id, "hash1", "ci", &["user:read".to_string()], None, default_tenant, None)
             .await
             .unwrap();
         let row = repo.get_api_key_by_hash("hash1").await.unwrap().unwrap();
