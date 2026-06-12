@@ -74,14 +74,17 @@ async fn main() -> anyhow::Result<()> {
     health_reporter.set_serving::<AuthServiceServer<AuthSvc>>().await;
 
     // Defense-in-depth: require the shared internal token on AuthService calls.
-    // Health is left ungated so K8s/compose probes work.
+    // Health is left ungated so K8s/compose probes work. Fail-closed: a missing
+    // token rejects every call unless INTERNAL_AUTH_OPTIONAL is explicitly set,
+    // so a misconfigured deploy is locked rather than wide open.
     let token = common::config::internal_token();
+    let optional = token.is_empty() && common::config::internal_auth_optional();
     let check = move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
-        if token.is_empty() {
+        if optional {
             return Ok(req);
         }
         match req.metadata().get("x-internal-token").and_then(|v| v.to_str().ok()) {
-            Some(t) if t == token => Ok(req),
+            Some(t) if !token.is_empty() && t == token => Ok(req),
             _ => Err(tonic::Status::unauthenticated(
                 "missing or invalid internal service token",
             )),
