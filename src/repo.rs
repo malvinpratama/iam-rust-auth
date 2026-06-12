@@ -1026,7 +1026,8 @@ mod integration {
     #[tokio::test]
     async fn list_roles_with_permissions_single_query() {
         let (repo, _node) = setup().await;
-        let roles = repo.list_roles_with_permissions().await.unwrap();
+        // admin is a built-in template (tenant_id NULL), visible from any tenant.
+        let roles = repo.list_roles_with_permissions(Uuid::nil()).await.unwrap();
         let admin = roles.iter().find(|r| r.name == "admin").expect("admin role seeded");
         assert!(!admin.permissions.is_empty(), "admin should carry perms via the single query");
     }
