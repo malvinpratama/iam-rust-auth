@@ -1174,6 +1174,13 @@ impl AuthService for AuthSvc {
             .map_err(|_| Status::internal("db error"))?
             .filter(|u| u.deleted_at.is_none() && u.totp_enabled && u.totp_secret.is_some())
             .ok_or_else(|| Status::unauthenticated("invalid credentials"))?;
+        // The MFA step is brute-forceable (6-digit TOTP / recovery codes) within
+        // the MFA token's TTL, so it gets the same lockout as the password step.
+        if let Some(until) = user.locked_until {
+            if until > Utc::now() {
+                return Err(Status::unauthenticated("account temporarily locked, try again later"));
+            }
+        }
         let secret = user.totp_secret.clone().unwrap();
         let ok = crate::totp::validate(&req.code, &secret)
             || self
@@ -1182,9 +1189,20 @@ impl AuthService for AuthSvc {
                 .await
                 .map_err(|_| Status::internal("db error"))?;
         if !ok {
+            let max = common::config::login_max_failures();
+            if max > 0 {
+                if let Ok(n) = self.repo.increment_login_failure(uid).await {
+                    if (n as i64) >= max {
+                        let until = Utc::now() + Duration::seconds(common::config::login_lockout_secs());
+                        let _ = self.repo.lock_user(uid, until).await;
+                        self.audit_as(&uid.to_string(), &user.email, "login.locked", "", "too many failed mfa attempts", None).await;
+                    }
+                }
+            }
             self.audit_as(&uid.to_string(), &user.email, "login.mfa_failure", "", "", None).await;
             return Err(Status::unauthenticated("invalid code"));
         }
+        let _ = self.repo.reset_login_state(uid).await; // clear failure counter on success
         self.audit_as(&uid.to_string(), &user.email, "login.success", "", "2fa", None).await;
         let pair = self.issue_for_active_tenant(uid, &user.email).await?;
         Ok(Response::new(pair))
