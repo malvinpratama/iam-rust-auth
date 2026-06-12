@@ -1741,6 +1741,36 @@ impl AuthService for AuthSvc {
         Ok(Response::new(GenericResponse { success: true }))
     }
 
+    // Authenticated self-service password change: prove the current password, set
+    // a new one, revoke all refresh tokens (no email/reset-token round-trip).
+    async fn change_password(
+        &self,
+        request: Request<ChangePasswordRequest>,
+    ) -> Result<Response<GenericResponse>, Status> {
+        let uid = caller_uuid(request.metadata())?;
+        let req = request.into_inner();
+        if req.new_password.len() < 8 {
+            return Err(Status::invalid_argument("password must be at least 8 characters"));
+        }
+        let user = self
+            .repo
+            .get_user_by_id(uid)
+            .await
+            .map_err(|_| Status::internal("db error"))?
+            .ok_or_else(|| Status::unauthenticated("user not found"))?;
+        if !password::verify(&user.password_hash, &req.old_password) {
+            return Err(Status::unauthenticated("current password is incorrect"));
+        }
+        let hash = password::hash(&req.new_password).map_err(|_| Status::internal("failed to hash password"))?;
+        self.repo
+            .update_password(uid, &hash)
+            .await
+            .map_err(|_| Status::internal("failed to update password"))?;
+        let _ = self.repo.revoke_all_user_refresh_tokens(uid).await;
+        self.audit_as(&uid.to_string(), &user.email, "password.change", "", "", None).await;
+        Ok(Response::new(GenericResponse { success: true }))
+    }
+
     // ── Audit (v0.2) ────────────────────────────────────────
 
     async fn list_audit_events(
