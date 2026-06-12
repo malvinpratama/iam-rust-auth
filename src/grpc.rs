@@ -979,7 +979,7 @@ impl AuthService for AuthSvc {
             .map_err(|_| Status::internal("user lookup failed"))?
             .ok_or_else(|| Status::not_found("no user with that email"))?;
         self.repo
-            .create_membership(user.id, tenant)
+            .add_member(user.id, tenant)
             .await
             .map_err(|_| Status::internal("could not add member"))?;
         self.audit_as(&user.id.to_string(), &user.email, "member.add", &tenant.to_string(), "", Some(tenant)).await;

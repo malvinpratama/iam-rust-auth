@@ -1,7 +1,7 @@
 //! Postgres access for the auth service via sqlx (runtime-checked queries).
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres};
 use uuid::Uuid;
 
 #[derive(FromRow)]
@@ -630,30 +630,58 @@ impl Repo {
             .await
     }
 
-    /// M6.4: create a project in a tenant.
+    /// M6.4: create a project in a tenant. Phase 3b: runs under RLS so WITH CHECK
+    /// pins the new row to the active tenant at the database.
     pub async fn create_project(&self, tenant_id: Uuid, slug: &str, name: &str) -> sqlx::Result<ProjectRow> {
-        sqlx::query_as::<_, ProjectRow>(
+        let mut tx = self.tenant_tx(tenant_id).await?;
+        let row = sqlx::query_as::<_, ProjectRow>(
             "INSERT INTO projects (tenant_id, slug, name) VALUES ($1, $2, $3) \
              RETURNING id, tenant_id, slug, name",
         )
         .bind(tenant_id)
         .bind(slug)
         .bind(name)
-        .fetch_one(&self.pool)
-        .await
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
     }
 
-    /// M6.4b: projects in a tenant, read under Row-Level Security — the query
-    /// runs in a transaction as the restricted iam_rls role with app.tenant_id
-    /// set, so Postgres enforces tenant isolation on top of the WHERE (a forgotten
-    /// filter still cannot leak another tenant's rows; the policy is fail-closed).
-    pub async fn list_projects_by_tenant(&self, tenant_id: Uuid) -> sqlx::Result<Vec<ProjectRow>> {
+    /// M6.4: enroll a member into a tenant via the admin path, under RLS (WITH
+    /// CHECK pins the row to the active tenant). Distinct from `create_membership`,
+    /// which the pre-auth register/bootstrap paths use on the direct connection.
+    pub async fn add_member(&self, user_id: Uuid, tenant_id: Uuid) -> sqlx::Result<()> {
+        let mut tx = self.tenant_tx(tenant_id).await?;
+        sqlx::query(
+            "INSERT INTO memberships (user_id, tenant_id, status) VALUES ($1, $2, 'active') \
+             ON CONFLICT (user_id, tenant_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6.4b: begin a transaction that assumes the restricted iam_rls role with
+    /// app.tenant_id set, so Postgres RLS enforces tenant isolation on every query
+    /// run inside it — on reads (a forgotten WHERE still can't leak another
+    /// tenant) and, for Phase 3b, on writes (WITH CHECK rejects a cross-tenant
+    /// INSERT/UPDATE). The policy is fail-closed when app.tenant_id is unset.
+    async fn tenant_tx(&self, tenant_id: Uuid) -> sqlx::Result<sqlx::Transaction<'_, Postgres>> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SET LOCAL ROLE iam_rls").execute(&mut *tx).await?;
         sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
             .bind(tenant_id.to_string())
             .execute(&mut *tx)
             .await?;
+        Ok(tx)
+    }
+
+    /// M6.4b: projects in a tenant, read under Row-Level Security.
+    pub async fn list_projects_by_tenant(&self, tenant_id: Uuid) -> sqlx::Result<Vec<ProjectRow>> {
+        let mut tx = self.tenant_tx(tenant_id).await?;
         let rows = sqlx::query_as::<_, ProjectRow>(
             "SELECT id, tenant_id, slug, name FROM projects WHERE tenant_id = $1 ORDER BY name",
         )
@@ -666,12 +694,7 @@ impl Repo {
 
     /// M6.4b: members of a tenant (joined to users), read under Row-Level Security.
     pub async fn list_members_by_tenant(&self, tenant_id: Uuid) -> sqlx::Result<Vec<MemberRow>> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL ROLE iam_rls").execute(&mut *tx).await?;
-        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
-            .bind(tenant_id.to_string())
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = self.tenant_tx(tenant_id).await?;
         let rows = sqlx::query_as::<_, MemberRow>(
             "SELECT u.id AS user_id, u.email, m.status FROM memberships m \
              JOIN users u ON u.id = m.user_id WHERE m.tenant_id = $1 ORDER BY u.email",
@@ -683,13 +706,16 @@ impl Repo {
         Ok(rows)
     }
 
-    /// M6.4: remove a user from a tenant.
+    /// M6.4: remove a user from a tenant. Phase 3b: runs under RLS so the DELETE
+    /// only sees (and can only remove) the active tenant's membership row.
     pub async fn remove_member(&self, user_id: Uuid, tenant_id: Uuid) -> sqlx::Result<()> {
+        let mut tx = self.tenant_tx(tenant_id).await?;
         sqlx::query("DELETE FROM memberships WHERE user_id = $1 AND tenant_id = $2")
             .bind(user_id)
             .bind(tenant_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -834,6 +860,9 @@ impl Repo {
     ) -> sqlx::Result<()> {
         // Resolve the role within the tenant (own role, else a built-in template,
         // preferring the tenant-specific one) — never another tenant's role.
+        // Phase 3b: under RLS, the role lookup only sees this tenant's roles +
+        // NULL templates, and WITH CHECK pins the new user_roles row to the tenant.
+        let mut tx = self.tenant_tx(tenant_id).await?;
         sqlx::query(
             "INSERT INTO user_roles (user_id, role_id, tenant_id, project_id) \
              SELECT $1, r.id, $3, $4 FROM roles r \
@@ -844,8 +873,9 @@ impl Repo {
         .bind(role_name)
         .bind(tenant_id)
         .bind(project_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -856,6 +886,8 @@ impl Repo {
         tenant_id: Uuid,
         project_id: Option<Uuid>,
     ) -> sqlx::Result<()> {
+        // Phase 3b: under RLS the DELETE only sees this tenant's assignments.
+        let mut tx = self.tenant_tx(tenant_id).await?;
         sqlx::query(
             "DELETE FROM user_roles ur \
              WHERE ur.user_id = $1 AND ur.role_id = (SELECT r.id FROM roles r WHERE r.name = $2) \
@@ -865,8 +897,9 @@ impl Repo {
         .bind(role_name)
         .bind(tenant_id)
         .bind(project_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -890,33 +923,41 @@ impl Repo {
     }
 
     pub async fn create_role(&self, name: &str, description: &str, tenant_id: Uuid) -> sqlx::Result<RoleRow> {
-        sqlx::query_as::<_, RoleRow>(
+        let mut tx = self.tenant_tx(tenant_id).await?;
+        let row = sqlx::query_as::<_, RoleRow>(
             "INSERT INTO roles (name, description, tenant_id) VALUES ($1, $2, $3) RETURNING id, name, description",
         )
         .bind(name)
         .bind(description)
         .bind(tenant_id)
-        .fetch_one(&self.pool)
-        .await
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
     }
 
     pub async fn update_role(&self, name: &str, description: &str, tenant_id: Uuid) -> sqlx::Result<Option<RoleRow>> {
-        sqlx::query_as::<_, RoleRow>(
+        let mut tx = self.tenant_tx(tenant_id).await?;
+        let row = sqlx::query_as::<_, RoleRow>(
             "UPDATE roles SET description = $2 WHERE name = $1 AND tenant_id = $3 RETURNING id, name, description",
         )
         .bind(name)
         .bind(description)
         .bind(tenant_id)
-        .fetch_optional(&self.pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
     }
 
     pub async fn delete_role(&self, name: &str, tenant_id: Uuid) -> sqlx::Result<()> {
+        let mut tx = self.tenant_tx(tenant_id).await?;
         sqlx::query("DELETE FROM roles WHERE name = $1 AND tenant_id = $2")
             .bind(name)
             .bind(tenant_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -964,6 +1005,8 @@ impl Repo {
     /// M6: grant a permission to one of the TENANT's own roles (built-in
     /// templates are platform-managed and shared, so not mutable per-tenant).
     pub async fn grant_permission(&self, role_name: &str, perm_name: &str, tenant_id: Uuid) -> sqlx::Result<()> {
+        // Phase 3b: under RLS the role lookup only resolves this tenant's roles.
+        let mut tx = self.tenant_tx(tenant_id).await?;
         sqlx::query(
             "INSERT INTO role_permissions (role_id, permission_id) \
              SELECT r.id, p.id FROM roles r, permissions p \
@@ -972,12 +1015,14 @@ impl Repo {
         .bind(role_name)
         .bind(perm_name)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn revoke_permission(&self, role_name: &str, perm_name: &str, tenant_id: Uuid) -> sqlx::Result<()> {
+        let mut tx = self.tenant_tx(tenant_id).await?;
         sqlx::query(
             "DELETE FROM role_permissions \
              WHERE role_id = (SELECT id FROM roles WHERE name = $1 AND tenant_id = $3) \
@@ -986,8 +1031,9 @@ impl Repo {
         .bind(role_name)
         .bind(perm_name)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -1056,6 +1102,37 @@ mod integration {
         repo.revoke_api_key("k1", id).await.unwrap();
         let row2 = repo.get_api_key_by_hash("hash1").await.unwrap().unwrap();
         assert!(row2.revoked_at.is_some(), "key should be revoked");
+    }
+
+    // Phase 3b: a tenant-scoped write run via the iam_rls path (create_project
+    // here) must succeed for the active tenant, and a write targeting ANOTHER
+    // tenant while scoped to A must be rejected by the RLS WITH CHECK policy.
+    #[tokio::test]
+    async fn rls_with_check_rejects_cross_tenant_write() {
+        let (repo, _node) = setup().await;
+        let tenant_a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(); // seeded default
+        let tenant_b: Uuid =
+            sqlx::query_scalar("INSERT INTO tenants (slug, name) VALUES ('beta', 'Beta') RETURNING id")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+
+        // The wrapped write path commits for the active tenant.
+        repo.create_project(tenant_a, "ok", "OK").await.unwrap();
+
+        // Scoped to A, an INSERT for B is rejected by WITH CHECK.
+        let mut tx = repo.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE iam_rls").execute(&mut *tx).await.unwrap();
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant_a.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let res = sqlx::query("INSERT INTO projects (tenant_id, slug, name) VALUES ($1, 'evil', 'Evil')")
+            .bind(tenant_b)
+            .execute(&mut *tx)
+            .await;
+        assert!(res.is_err(), "cross-tenant write must be rejected by RLS WITH CHECK");
     }
 
     #[tokio::test]
