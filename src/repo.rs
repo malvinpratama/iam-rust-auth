@@ -1190,4 +1190,73 @@ mod integration {
             "a recovery code must be one-time"
         );
     }
+
+    // Phase 3c (T4): open a SECOND connection as the prepared non-superuser iam_app
+    // and prove the cutover is safe at the database layer — Kept-strict tables are
+    // fail-closed without app.tenant_id, relaxed Kelas-B tables stay readable, and a
+    // cross-tenant write is rejected by WITH CHECK (without SET ROLE, since the
+    // connection role itself is non-superuser).
+    #[tokio::test]
+    async fn iam_app_cutover_class_split_and_with_check() {
+        let node = Postgres::default().start().await.expect("start postgres");
+        let port = node.get_host_port_ipv4(5432).await.expect("port");
+        let admin_url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let admin = PgPoolOptions::new().max_connections(5).connect(&admin_url).await.expect("connect admin");
+        sqlx::migrate!("./migrations").run(&admin).await.expect("migrate");
+
+        let default_tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+
+        // Seed a user with a membership + a user_role, both in the default tenant.
+        let uid: Uuid = sqlx::query_scalar("INSERT INTO users (email, password_hash) VALUES ('m@x.test','x') RETURNING id")
+            .fetch_one(&admin).await.unwrap();
+        sqlx::query("INSERT INTO memberships (user_id, tenant_id) VALUES ($1, $2)")
+            .bind(uid).bind(default_tenant).execute(&admin).await.unwrap();
+        let role_id: i64 = sqlx::query_scalar("SELECT id FROM roles WHERE name='admin' LIMIT 1")
+            .fetch_one(&admin).await.unwrap();
+        sqlx::query("INSERT INTO user_roles (user_id, role_id, tenant_id) VALUES ($1, $2, $3)")
+            .bind(uid).bind(role_id).bind(default_tenant).execute(&admin).await.unwrap();
+        let tenant_b: Uuid = sqlx::query_scalar("INSERT INTO tenants (slug, name) VALUES ('beta','Beta') RETURNING id")
+            .fetch_one(&admin).await.unwrap();
+
+        // Enable login for the prepared (NOLOGIN) iam_app role and connect as it.
+        sqlx::query("ALTER ROLE iam_app WITH LOGIN PASSWORD 'iamapp_test'").execute(&admin).await.unwrap();
+        let app_url = format!("postgres://iam_app:iamapp_test@127.0.0.1:{port}/postgres");
+        let app = PgPoolOptions::new().max_connections(3).connect(&app_url).await.expect("connect iam_app");
+
+        // 1. The connection role is the non-superuser iam_app.
+        let (who, is_super): (String, bool) = sqlx::query_as(
+            "SELECT current_user::text, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)")
+            .fetch_one(&app).await.unwrap();
+        assert_eq!(who, "iam_app");
+        assert!(!is_super, "iam_app must be a non-superuser");
+
+        // 2. Kept-strict tables are fail-closed (0 rows) without app.tenant_id.
+        for tbl in ["projects", "user_roles"] {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {tbl}"))
+                .fetch_one(&app).await.unwrap();
+            assert_eq!(n, 0, "Kept-strict {tbl} must be 0 without app.tenant_id");
+        }
+
+        // 3. Relaxed Kelas-B memberships stay readable without a tenant context.
+        let members: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships").fetch_one(&app).await.unwrap();
+        assert!(members >= 1, "relaxed memberships must be readable by iam_app");
+
+        // 4. With app.tenant_id set, the tenant's Kept-strict rows appear.
+        let mut tx = app.begin().await.unwrap();
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)").bind(default_tenant.to_string()).execute(&mut *tx).await.unwrap();
+        let ur: i64 = sqlx::query_scalar("SELECT count(*) FROM user_roles").fetch_one(&mut *tx).await.unwrap();
+        assert!(ur >= 1, "with app.tenant_id=default, iam_app must see the default tenant's user_roles");
+        tx.commit().await.unwrap();
+
+        // 5. WITH CHECK: same-tenant projects INSERT passes, cross-tenant rejected.
+        let mut tx = app.begin().await.unwrap();
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)").bind(default_tenant.to_string()).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO projects (tenant_id, slug, name) VALUES ($1, 'ok', 'OK')")
+            .bind(default_tenant).execute(&mut *tx).await.unwrap();
+        let bad = sqlx::query("INSERT INTO projects (tenant_id, slug, name) VALUES ($1, 'evil', 'Evil')")
+            .bind(tenant_b).execute(&mut *tx).await;
+        assert!(bad.is_err(), "cross-tenant write under iam_app must be rejected by RLS WITH CHECK");
+
+        let _node = node; // keep the container alive until the test ends
+    }
 }
