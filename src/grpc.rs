@@ -722,14 +722,12 @@ impl AuthService for AuthSvc {
         request: Request<ValidateTokenRequest>,
     ) -> Result<Response<ValidateTokenResponse>, Status> {
         let req = request.into_inner();
+        // parse_access rejects non-access tokens (MFA tokens, OIDC ID tokens) so
+        // only a genuine bearer access token can authenticate a request.
         let claims = self
             .jwt
-            .parse(&req.access_token)
+            .parse_access(&req.access_token)
             .map_err(|_| Status::unauthenticated("invalid or expired token"))?;
-        // An MFA-purpose token only completes a 2FA login; never a bearer token.
-        if !claims.purpose.is_empty() {
-            return Err(Status::unauthenticated("invalid token"));
-        }
         // Prefer the Redis denylist (shared across replicas); fall back to the
         // durable Postgres denylist when Redis is off or errors.
         let denied = match self.cache.is_denied(&claims.jti).await {
