@@ -23,17 +23,38 @@ use crate::repo::Repo;
 async fn main() -> anyhow::Result<()> {
     common::telemetry::init("auth");
 
-    if let Err(e) = common::config::validate_security() {
-        anyhow::bail!("insecure configuration: {e}");
+    // The `migrate` subcommand runs the embedded migrations and exits — used by the
+    // PreSync Job so the long-running server need not migrate on startup. Phase 3c:
+    // once the server connects as the least-privilege iam_app it cannot run DDL.
+    let migrate_only = std::env::args().nth(1).as_deref() == Some("migrate");
+
+    if !migrate_only {
+        if let Err(e) = common::config::validate_security() {
+            anyhow::bail!("insecure configuration: {e}");
+        }
     }
 
     let db_url = common::must_env("AUTH_DATABASE_URL");
-    let port = common::env_or("AUTH_GRPC_PORT", "50051");
 
-    // Connect with a startup retry loop (Postgres may still be booting).
+    // Connect with a startup retry loop (Postgres may still be booting; the retry
+    // also lets a freshly-scheduled migrate Job survive the brief window before its
+    // NetworkPolicy is programmed).
     let pool = connect_with_retry(&db_url).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
-    tracing::info!("migrations applied");
+
+    // Run migrations for the `migrate` subcommand, or on startup unless
+    // AUTO_MIGRATE=false (set at cutover once the Job owns them and the server
+    // connects as iam_app, which cannot run DDL).
+    if migrate_only || common::env_or("AUTO_MIGRATE", "true") != "false" {
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        tracing::info!("migrations applied");
+    } else {
+        tracing::info!("auto-migrate disabled (AUTO_MIGRATE=false) — migrations run by the Job");
+    }
+    if migrate_only {
+        return Ok(());
+    }
+
+    let port = common::env_or("AUTH_GRPC_PORT", "50051");
 
     let jwt_cfg = JwtConfig::from_env();
     let jwt = keys::load_jwt_manager(&pool, jwt_cfg.issuer.clone(), jwt_cfg.access_ttl_secs).await?;
