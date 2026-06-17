@@ -1,0 +1,28 @@
+name: lockfile
+
+# Regenerate + commit Cargo.lock so the binary's transitive deps are pinned,
+# guarding against resolver drift between builds (a drifted RS256-signing crate
+# silently broke login once). Trigger via the Actions tab on a branch; it commits
+# Cargo.lock back to that branch.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo generate-lockfile
+      - name: Commit Cargo.lock
+        run: |
+          if [ -z "$(git status --porcelain Cargo.lock)" ]; then
+            echo "Cargo.lock unchanged"; exit 0
+          fi
+          git config user.name "Malvin Pratama Putra"
+          git config user.email "45458498+malvinpratama@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: pin transitive deps via committed Cargo.lock (drift guard)"
+          git push origin HEAD:${{ github.ref_name }}
