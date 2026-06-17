@@ -1,0 +1,30 @@
+name: lockfile
+
+# Generates + commits Cargo.lock so the binary's transitive deps are pinned,
+# guarding against resolver drift between builds (a drifted RS256-signing crate
+# silently broke login once). Runs on push to this chore branch and commits
+# Cargo.lock back; the guard skips the resulting lock commit so it doesn't loop.
+on:
+  push:
+    branches: [chore/cargo-lock]
+
+permissions:
+  contents: write
+
+jobs:
+  lock:
+    if: "!contains(github.event.head_commit.message, 'Cargo.lock')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo generate-lockfile
+      - name: Commit Cargo.lock
+        run: |
+          if [ -z "$(git status --porcelain Cargo.lock)" ]; then
+            echo "Cargo.lock unchanged"; exit 0
+          fi
+          git config user.name "Malvin Pratama Putra"
+          git config user.email "45458498+malvinpratama@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: commit Cargo.lock to pin transitive deps (drift guard)"
+          git push
