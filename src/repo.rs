@@ -4,6 +4,12 @@ use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool, Postgres};
 use uuid::Uuid;
 
+/// The fixed default-tenant UUID seeded by migration 0010 (mirrors
+/// grpc::DEFAULT_TENANT_ID). Used to set app.tenant_id for the default-tenant
+/// user_roles writes in register/bootstrap so they pass RLS once the app
+/// connects as the non-superuser iam_app (Phase 3c).
+const DEFAULT_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
+
 #[derive(FromRow)]
 pub struct UserRow {
     pub id: Uuid,
@@ -155,6 +161,12 @@ impl Repo {
         role: &str,
     ) -> sqlx::Result<Uuid> {
         let mut tx = self.pool.begin().await?;
+        // The user_roles write below targets the default tenant (column DEFAULT) — set
+        // app.tenant_id so it passes RLS WITH CHECK once connected as iam_app (Phase 3c).
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(DEFAULT_TENANT_ID)
+            .execute(&mut *tx)
+            .await?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
         )
@@ -331,6 +343,12 @@ impl Repo {
         payload: &str,
     ) -> sqlx::Result<()> {
         let mut tx = self.pool.begin().await?;
+        // The user_roles write below targets the default tenant (column DEFAULT) — set
+        // app.tenant_id so it passes RLS WITH CHECK once connected as iam_app (Phase 3c).
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(DEFAULT_TENANT_ID)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
             .bind(id)
             .bind(email)
@@ -679,6 +697,22 @@ impl Repo {
         Ok(tx)
     }
 
+    /// Phase 3c: like tenant_tx but ONLY sets app.tenant_id — it does NOT elevate to
+    /// iam_rls. For the pre-tenant / hot auth paths that read or write a Kept-strict
+    /// RLS table (roles/user_roles) with a known tenant. While the app still connects
+    /// as the superuser `app`, setting the GUC is a no-op (superuser bypasses RLS), so
+    /// behaviour is unchanged; once the connection role is the non-superuser iam_app,
+    /// the GUC is what satisfies the fail-closed policy. Not elevating to iam_rls keeps
+    /// it a no-op pre-cutover instead of enforcing RLS early on these hot paths.
+    async fn tenant_guc_tx(&self, tenant_id: &str) -> sqlx::Result<sqlx::Transaction<'_, Postgres>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
+    }
+
     /// M6.4b: projects in a tenant, read under Row-Level Security.
     pub async fn list_projects_by_tenant(&self, tenant_id: Uuid) -> sqlx::Result<Vec<ProjectRow>> {
         let mut tx = self.tenant_tx(tenant_id).await?;
@@ -776,7 +810,10 @@ impl Repo {
         tenant_id: Uuid,
         project_id: Option<Uuid>,
     ) -> sqlx::Result<Vec<String>> {
-        sqlx::query_scalar(
+        // user_roles + roles are Kept-strict RLS (Phase 3c) — read with app.tenant_id
+        // set so a non-superuser iam_app connection sees this tenant's rows.
+        let mut tx = self.tenant_guc_tx(&tenant_id.to_string()).await?;
+        let rows = sqlx::query_scalar(
             "SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id \
              WHERE ur.user_id = $1 AND ur.tenant_id = $2 \
                AND (ur.project_id IS NULL OR ur.project_id = $3) ORDER BY r.name",
@@ -784,8 +821,10 @@ impl Repo {
         .bind(user_id)
         .bind(tenant_id)
         .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 
     /// M6.3: permissions scoped to the token's tenant (and optional project).
@@ -795,7 +834,10 @@ impl Repo {
         tenant_id: Uuid,
         project_id: Option<Uuid>,
     ) -> sqlx::Result<Vec<String>> {
-        sqlx::query_scalar(
+        // Joins user_roles + roles (Kept-strict) — read under app.tenant_id so an
+        // iam_app connection can see the rows.
+        let mut tx = self.tenant_guc_tx(&tenant_id.to_string()).await?;
+        let rows = sqlx::query_scalar(
             "SELECT DISTINCT p.name FROM user_roles ur \
              JOIN role_permissions rp ON rp.role_id = ur.role_id \
              JOIN permissions p ON p.id = rp.permission_id \
@@ -805,8 +847,10 @@ impl Repo {
         .bind(user_id)
         .bind(tenant_id)
         .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 
     pub async fn role_exists(&self, name: &str) -> sqlx::Result<bool> {
