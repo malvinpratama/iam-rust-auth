@@ -108,13 +108,19 @@ impl AuthSvc {
         let access = self
             .jwt
             .issue(&user_id.to_string(), email, &tenant_id.to_string(), &proj_str)
-            .map_err(|_| Status::internal("failed to sign token"))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "issue access token failed");
+                Status::internal("failed to sign token")
+            })?;
         let refresh = gen_refresh_token();
         let expires = Utc::now() + Duration::seconds(self.refresh_ttl_secs);
         self.repo
             .create_refresh_token(user_id, &hash_token(&refresh), expires, tenant_id, project_id)
             .await
-            .map_err(|_| Status::internal("failed to persist refresh token"))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "persist refresh token failed");
+                Status::internal("failed to persist refresh token")
+            })?;
         Ok(TokenPair {
             access_token: access,
             refresh_token: refresh,
